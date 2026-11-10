@@ -1,18 +1,21 @@
 #!/usr/bin/env python
 """
-Train or evaluate the FGN profile model, both experiments (config `experiment`), one GPU or DDP via torchrun.
+Train or evaluate the FGN profile model, every experiment (config `experiment`), one GPU or DDP via torchrun.
 
     python train.py --set experiment=cutoff input_drift_mode=lagged        # observed surface -> D_input
     python train.py --set experiment=sparse input_drift_mode=shallowest    # observed every `spacing` m
+    python train.py --set experiment=neighbours neighbour_max_km=50        # whole profile from nearby casts
     python train.py --eval-only --split val --max-profiles 50000 --set ckpt_dir=<run> processed_dir=<data>
 
 Training resumes from <ckpt_dir>/last.pt. Every validation writes the scores (metrics.py) and the best checkpoint
-best.pt; --eval-only writes <ckpt_dir>/<split>_metrics.npz.
+best.pt; --eval-only writes <ckpt_dir>/<split>_metrics[_TAG].npz, and for "neighbours" also the scores of the
+inverse-distance-weighted mean of the casts (<split>_metrics[_TAG]_idw.npz).
 """
 from __future__ import annotations
 
 import argparse
 import copy
+import dataclasses
 import datetime
 import logging
 import math
@@ -29,14 +32,15 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
 from config import FROZEN_ON_RESUME, Config, apply_overrides, config_from_checkpoint
-from dataset import (DRIFT_MODES, ProfileDataset, cutoff_levels, drift_indices, load_grid, load_or_compute_basin_monthly,
-                     load_or_compute_stats, max_input_levels, resolve_splits, subtract_shallowest)
+from dataset import (DRIFT_MODES, cutoff_levels, drift_indices, load_grid, load_or_compute_basin_monthly,
+                     load_or_compute_stats, make_dataset, max_input_levels, resolve_splits, subtract_shallowest)
 from metrics import (Evaluator, combine_losses, crps_ensemble, ensemble_median, fill_columns, loss_weights,
                      mean_member_distance, scalars, summary_line)
 from model import aux_feature_indices, build_model, gather_levels, observation_mask
 
 log = logging.getLogger("train")
 FGN_MAX_SEQUENCES = 19 * 1024  # profile copies per forward pass in evaluation when fgn_member_chunk = 0
+NEIGHBOUR_KEYS = ("src_x", "src_len", "src_ctx", "src_dxy")
 
 
 # --------------------------------------------------------------------------------------- infrastructure
@@ -97,7 +101,7 @@ def make_scheduler(opt, cfg: Config, total_steps: int):
 def init_wandb(cfg: Config, run_id: Optional[str], job_type: str, extra: dict):
     import wandb
 
-    project = cfg.wandb_project or ("blacksea-o2-sparse" if cfg.experiment == "sparse" else "blacksea-o2-profiles")
+    project = cfg.wandb_project or "blacksea-o2-" + {"cutoff": "profiles"}.get(cfg.experiment, cfg.experiment)
     return wandb.init(project=project, entity=cfg.wandb_entity, name=cfg.wandb_run_name, id=run_id,
                       resume="allow" if run_id else None, mode=os.environ.get("WANDB_MODE", cfg.wandb_mode),
                       job_type=job_type, dir=cfg.ckpt_dir, config={**cfg.to_dict(), **extra})
@@ -138,8 +142,8 @@ def save_checkpoint(path: Path, **payload) -> None:
 
 
 def check_config(cfg: Config, depth) -> None:
-    if cfg.experiment not in ("cutoff", "sparse"):
-        raise ValueError(f"experiment must be 'cutoff' or 'sparse', not {cfg.experiment!r}")
+    if cfg.experiment not in ("cutoff", "sparse", "neighbours"):
+        raise ValueError(f"experiment must be 'cutoff', 'sparse' or 'neighbours', not {cfg.experiment!r}")
     if cfg.input_drift_mode not in DRIFT_MODES:
         raise ValueError(f"input_drift_mode must be one of {DRIFT_MODES}, not {cfg.input_drift_mode!r}")
     if cfg.fgn_train_members < 2 or cfg.fgn_eval_members < 2 or not 0.0 <= cfg.fgn_crps_alpha <= 1.0:
@@ -152,8 +156,15 @@ def check_config(cfg: Config, depth) -> None:
         if not ks or too_deep:
             raise ValueError(f"val_cutoff_depths_m give D_input {d_in}; none may exceed max_input_depth_m="
                              f"{cfg.max_input_depth_m} (the model never trains on deeper cutoffs)")
-    elif min(cfg.sparse_train_spacings_m) <= 0 or min(cfg.sparse_val_spacings_m) <= 0:
+    elif cfg.experiment == "sparse" and (min(cfg.sparse_train_spacings_m) <= 0 or min(cfg.sparse_val_spacings_m) <= 0):
         raise ValueError("sparse spacings must be positive")
+    elif cfg.experiment == "neighbours":
+        if cfg.input_drift_mode == "shallowest":
+            raise ValueError("experiment=neighbours takes input_drift_mode none or lagged")
+        if cfg.neighbour_casts < 1 or not 1 <= (cfg.neighbour_eval_casts or 1) <= cfg.neighbour_casts:
+            raise ValueError("neighbour_casts must be >= 1 and neighbour_eval_casts in [1, neighbour_casts]")
+        if max(cfg.neighbour_val_km) < cfg.neighbour_max_km:
+            raise ValueError("the last neighbour_val_km bin must reach neighbour_max_km")
 
 
 # --------------------------------------------------------------------------------------- observations
@@ -162,6 +173,9 @@ def eval_rows(cfg: Config, depth):
     if cfg.experiment == "sparse":
         spacings = [float(s) for s in cfg.sparse_val_spacings_m]
         return spacings, spacings, "spacing (m)"
+    if cfg.experiment == "neighbours":
+        km = sorted(float(v) for v in cfg.neighbour_val_km)
+        return km, km, "distance to the nearest cast (km)"
     ks, d_in = cutoff_levels(depth, cfg.val_cutoff_depths_m, cfg.min_input_levels)
     return ks, d_in, "D_input (m)"
 
@@ -190,7 +204,8 @@ def nominal_observed(cfg: Config, depth, spacings) -> np.ndarray:
 def fgn_members(net, inputs: tuple, n_members: int, chunk: int = 0, generator=None):
     """All members of one batch, drawn `chunk` at a time: O2 (B, M, T), idx, mask, aux (B, M, T, A) or None."""
     bsz = inputs[0].shape[0]
-    step = max(1, min(n_members, FGN_MAX_SEQUENCES // max(bsz, 1))) if chunk <= 0 else min(chunk, n_members)
+    casts = inputs[0].shape[1] + 1 if inputs[0].dim() == 4 else 1  # "neighbours": about (K + 1) x longer sequences
+    step = max(1, min(n_members, FGN_MAX_SEQUENCES // max(bsz * casts, 1))) if chunk <= 0 else min(chunk, n_members)
     o2, aux, out = [], [], None
     for start in range(0, n_members, step):
         m = min(step, n_members - start)
@@ -200,6 +215,21 @@ def fgn_members(net, inputs: tuple, n_members: int, chunk: int = 0, generator=No
         o2.append(out[0])
         aux.append(out[3])
     return torch.cat(o2, dim=1), out[1], out[2], (torch.cat(aux, dim=1) if aux[0] is not None else None)
+
+
+def idw_baseline(src_x, src_len, src_dxy, idx, feat):
+    """Inverse-distance-squared mean of the casts at every level, a cast counting down to its bottom (deeper than
+    every cast: the deepest cast's last value) -> (B, 1, T, len(feat)), as a one-member ensemble."""
+    nz, nv = src_x.shape[2], feat.numel()
+    lev = torch.arange(nz, device=src_x.device)
+    last = torch.minimum(lev[None, None, :], (src_len - 1).clamp(min=0)[..., None])
+    xs = src_x.index_select(-1, feat).gather(2, last[..., None].expand(-1, -1, -1, nv))
+    w = (src_len > 0).float() / src_dxy.float().norm(dim=-1).clamp(min=1.0) ** 2
+    wz = w[..., None] * (lev[None, None, :] < src_len[..., None]).float()
+    deepest = (w * (src_len == src_len.amax(dim=1, keepdim=True)).float())[..., None].expand_as(wz)
+    wz = torch.where(wz.sum(dim=1, keepdim=True) > 0, wz, deepest)
+    est = (wz[..., None] * xs.float()).sum(dim=1) / wz.sum(dim=1)[..., None].clamp(min=1e-12)
+    return est.gather(1, idx[..., None].expand(-1, -1, nv)).unsqueeze(1)
 
 
 # --------------------------------------------------------------------------------------- training / evaluation
@@ -226,15 +256,20 @@ def train_one_epoch(model, loader, opt, sched, scaler, cfg: Config, device, stat
         x, valid_len, ctx = (batch[k].to(device, non_blocking=True) for k in ("x", "valid_len", "ctx"))
         if lev is None:
             lev = torch.arange(x.shape[1], device=device)
-        if cfg.experiment == "sparse":
-            obs = sparse_obs(cfg, net, valid_len, spacings[torch.randint(len(spacings), (x.shape[0],), device=device)])
-            has_obs = obs.any(dim=1)
+        if cfg.experiment == "neighbours":
+            src = [batch[k].to(device, non_blocking=True) for k in NEIGHBOUR_KEYS]
+            inputs, has_obs = (*src, valid_len, ctx), (src[1] > 0).any(dim=1)
         else:
-            obs, has_obs = lev[None, :] < sample_cutoffs(valid_len, *k_lim)[:, None], None
-        if drift_idx is not None:
-            x = subtract_shallowest(x, obs, valid_len, drift_idx)
+            if cfg.experiment == "sparse":
+                obs = sparse_obs(cfg, net, valid_len, spacings[torch.randint(len(spacings), (x.shape[0],), device=device)])
+                has_obs = obs.any(dim=1)
+            else:
+                obs, has_obs = lev[None, :] < sample_cutoffs(valid_len, *k_lim)[:, None], None
+            if drift_idx is not None:
+                x = subtract_shallowest(x, obs, valid_len, drift_idx)
+            inputs = (x, obs, valid_len, ctx)
         with autocast(cfg, device):
-            pred, target_idx, target_mask, aux = model(x, obs, valid_len, ctx, n_members=cfg.fgn_train_members)
+            pred, target_idx, target_mask, aux = model(*inputs, n_members=cfg.fgn_train_members)
         mask = (target_mask if has_obs is None else target_mask & has_obs[:, None]).float()
         loss_o2, loss_aux = prediction_losses(cfg, pred, aux, x, target_idx, mask, ti, aux_idx)
         loss = combine_losses(cfg, loss_o2, loss_aux, loss_w)
@@ -263,18 +298,48 @@ def train_one_epoch(model, loader, opt, sched, scaler, cfg: Config, device, stat
 
 @torch.no_grad()
 def evaluate(model, loader, cfg: Config, grid: dict, stats, device, drift_idx) -> tuple:
-    """Scores of every row (D_input or spacing) -> (metrics arrays, example profiles for W&B)."""
+    """Scores of every row (D_input, spacing or distance to the nearest cast) -> (metrics arrays, example profiles
+    for W&B, metrics arrays of the inverse-distance-weighted mean of the casts or None)."""
     net = unwrap(model)
     net.eval()
     keys, rows, row_name = eval_rows(cfg, grid["depth"])
     ev = Evaluator(cfg, grid, stats, rows, row_name, device)
     gen = torch.Generator(device=device)
     gen.manual_seed(int(cfg.seed) + 1000 * (dist.get_rank() if dist.is_available() and dist.is_initialized() else 0))
-    example_row = len(keys) // 2 if cfg.experiment == "sparse" else int(np.argmin([abs(r - 50.0) for r in rows]))
-    examples = None
+    example_row = len(keys) // 2 if cfg.experiment != "cutoff" else int(np.argmin([abs(r - 50.0) for r in rows]))
+    examples, ev_idw = None, None
+    if cfg.experiment == "neighbours":
+        ev_idw = Evaluator(dataclasses.replace(cfg, fgn_eval_members=1), grid, stats, rows, row_name, device)
+        feat = torch.as_tensor(ev.feat, dtype=torch.long, device=device)
+        edges = torch.as_tensor(rows, dtype=torch.float32, device=device)
     for batch in loader:
         b = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
         lev = torch.arange(b["x"].shape[1], device=device)
+        if cfg.experiment == "neighbours":  # one pass, then the scores of each distance row
+            src = [b[k] for k in NEIGHBOUR_KEYS]
+            with autocast(cfg, device):
+                pred, idx, mask, aux = fgn_members(net, (*src, b["valid_len"], b["ctx"]), cfg.fgn_eval_members,
+                                                   cfg.fgn_member_chunk, gen)
+            base = idw_baseline(*src[:2], src[3], idx, feat)
+            near = torch.where(src[1] > 0, src[3].float().norm(dim=-1), torch.full_like(src[3][..., 0], float("inf")))
+            row = torch.bucketize(near.amin(dim=1), edges)  # no cast -> len(rows): not scored
+            obs = torch.zeros_like(b["x"][..., 0], dtype=torch.bool)
+            for i in range(len(rows)):
+                sel = row == i
+                if not bool(sel.any()):
+                    continue
+                common = (b["x"][sel], idx[sel], mask[sel], obs[sel], b["valid_len"][sel], b["x_raw"][sel],
+                          b["lat"][sel], b["lon"][sel], b["month"][sel])
+                truth, members = ev.update(i, pred[sel].float(), None if aux is None else aux[sel].float(), *common)
+                ev_idw.update(i, base[sel][..., 0], base[sel][..., 1:] if aux is not None else None, *common)
+                if examples is None and i == example_row and cfg.example_profiles > 0:
+                    order = torch.sort(b["valid_len"][sel], descending=True, stable=True).indices[:cfg.example_profiles]
+                    cols = fill_columns(truth[order], members[order], idx[sel][order], mask[sel][order])
+                    examples = {"truth": truth[order].cpu().numpy(), "observed": obs[sel][order].cpu().numpy(),
+                                "members": cols.cpu().numpy(), "center": ensemble_median(cols, dim=1).cpu().numpy(),
+                                "valid_len": b["valid_len"][sel][order].cpu().numpy(), "row": rows[i],
+                                "depth": np.asarray(grid["depth"]), "row_name": row_name, "rows": rows}
+            continue
         for i, key in enumerate(keys):
             if cfg.experiment == "sparse":
                 sub = b
@@ -303,11 +368,11 @@ def evaluate(model, loader, cfg: Config, grid: dict, stats, device, drift_idx) -
                 examples = {"truth": t.cpu().numpy(), "observed": o.cpu().numpy(), "members": cols.cpu().numpy(),
                             "center": ensemble_median(cols, dim=1).cpu().numpy(),
                             "valid_len": sub["valid_len"][keep][order].cpu().numpy(), "row": rows[i],
-                            "depth": np.asarray(grid["depth"]), "row_name": row_name}
+                            "depth": np.asarray(grid["depth"]), "row_name": row_name, "rows": rows}
     r = ev.finish()
     if cfg.experiment == "sparse":
         r["observed"] = nominal_observed(cfg, grid["depth"], rows)
-    return r, examples
+    return r, examples, (ev_idw.finish() if ev_idw is not None else None)
 
 
 # --------------------------------------------------------------------------------------- entry points
@@ -319,6 +384,7 @@ def parse_args():
     p.add_argument("--split", default="test", choices=["val", "test"])
     p.add_argument("--ckpt", default=None, help="checkpoint for --eval-only (default <ckpt_dir>/best.pt)")
     p.add_argument("--max-profiles", type=int, default=None, help="random fixed subset of the split (--eval-only)")
+    p.add_argument("--tag", default="", help="--eval-only output <split>_metrics_TAG.npz, e.g. 1cast")
     return p.parse_args()
 
 
@@ -347,16 +413,19 @@ def run_eval(args, ddp: bool, rank: int, device) -> None:
     cfg, grid, stats, model = load_run(path, args.set, device)
     check_config(cfg, grid["depth"])
     years = resolve_splits(cfg, load_grid(cfg)["years"])[args.split]
-    ds = ProfileDataset(cfg, grid, stats, years, max_profiles=args.max_profiles, seed=cfg.seed, in_memory=cfg.in_memory,
-                        extras=True)
-    r, examples = evaluate(model, make_loader(ds, cfg, cfg.eval_batch_size, False, ddp), cfg, grid, stats, device,
-                           drift_tensor(cfg, grid, device))
+    ds = make_dataset(cfg, grid, stats, years, False, max_profiles=args.max_profiles, seed=cfg.seed,
+                      in_memory=cfg.in_memory, extras=True)
+    r, examples, r_idw = evaluate(model, make_loader(ds, cfg, cfg.eval_batch_size, False, ddp), cfg, grid, stats, device,
+                                  drift_tensor(cfg, grid, device))
     if rank == 0:
-        out = Path(cfg.ckpt_dir) / f"{args.split}_metrics.npz"
+        out = Path(cfg.ckpt_dir) / f"{args.split}_metrics{'_' + args.tag if args.tag else ''}.npz"
         np.savez_compressed(out, **r)
         log.info("%s: %s -> %s", args.split, summary_line(r), out)
-        run = init_wandb(cfg, None, f"eval-{args.split}", {"checkpoint": str(path)})
-        wandb_log(r, args.split, 0, True, examples, {})
+        if r_idw is not None:
+            np.savez_compressed(out.with_name(out.stem + "_idw.npz"), **r_idw)
+            log.info("%s, inverse-distance-weighted casts: %s", args.split, summary_line(r_idw))
+        run = init_wandb(cfg, None, f"eval-{args.split}", {"checkpoint": str(path), "tag": args.tag})
+        wandb_log(r, args.split, 0, True, examples, scalars(r_idw, f"{args.split}_idw") if r_idw is not None else {})
         run.finish()
 
 
@@ -420,9 +489,9 @@ def main() -> None:
     log.info("Experiment %s | targets %s | loss weights %s | drift %s on %s", cfg.experiment, [grid["target"]] + aux_names,
              None if lw is None else np.round(lw, 3).tolist(), cfg.input_drift_mode, cfg.input_drift_vars)
 
-    train_ds = ProfileDataset(cfg, grid, stats, splits["train"], in_memory=cfg.in_memory)
-    val_ds = ProfileDataset(cfg, grid, stats, splits["val"], max_profiles=cfg.val_max_profiles, seed=cfg.seed,
-                            in_memory=cfg.in_memory, extras=True)
+    train_ds = make_dataset(cfg, grid, stats, splits["train"], True, in_memory=cfg.in_memory)
+    val_ds = make_dataset(cfg, grid, stats, splits["val"], False, max_profiles=cfg.val_max_profiles, seed=cfg.seed,
+                          in_memory=cfg.in_memory, extras=True)
     train_loader = make_loader(train_ds, cfg, cfg.batch_size, True, ddp)
     val_loader = make_loader(val_ds, cfg, cfg.eval_batch_size, False, ddp)
     steps_per_epoch = len(train_loader) if cfg.steps_per_epoch is None else min(len(train_loader), cfg.steps_per_epoch)
@@ -461,13 +530,15 @@ def main() -> None:
         train_one_epoch(model, train_loader, opt, sched, scaler, cfg, device, state, ti, aux_idx, drift_idx, loss_w,
                         k_lim, spacings, target_std, rank, ema)
         state["epoch"] = epoch + 1
-        r, examples = evaluate(ema.model if ema is not None else model, val_loader, cfg, grid, stats, device, drift_idx)
+        r, examples, r_idw = evaluate(ema.model if ema is not None else model, val_loader, cfg, grid, stats, device,
+                                      drift_idx)
         is_best = float(r["objective"]) < state["best_val"]
         if is_best:
             state["best_val"] = float(r["objective"])
         if rank == 0:
             log.info("epoch %d | %s%s", epoch + 1, summary_line(r), "  *best*" if is_best else "")
-            wandb_log(r, "val", state["step"], False, examples, {"val/best_loss": state["best_val"], "epoch": epoch + 1})
+            wandb_log(r, "val", state["step"], False, examples, {"val/best_loss": state["best_val"], "epoch": epoch + 1,
+                                                                  **(scalars(r_idw, "val_idw") if r_idw else {})})
             last = Path(cfg.ckpt_dir) / "last.pt"
             save_checkpoint(last, model=unwrap(model).state_dict(), ema=ema.model.state_dict() if ema else None,
                             optimizer=opt.state_dict(), scheduler=sched.state_dict(), scaler=scaler.state_dict(),
@@ -476,6 +547,8 @@ def main() -> None:
             if is_best:
                 shutil.copyfile(last, Path(cfg.ckpt_dir) / "best.pt")
                 np.savez_compressed(Path(cfg.ckpt_dir) / "val_metrics_best.npz", **r)
+                if r_idw is not None:
+                    np.savez_compressed(Path(cfg.ckpt_dir) / "val_metrics_idw.npz", **r_idw)
         if ddp:
             dist.barrier()
     if rank == 0:

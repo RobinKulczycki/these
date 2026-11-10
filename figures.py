@@ -13,6 +13,7 @@ Figures from the metrics files (<run>/val_metrics_best.npz, <run>/<split>_metric
 
     python figures.py all --out figs --processed-dir $D "new=$R/v4_cutoff" "old=$R/v3_fgn_lag"
 A run may be given as its folder (its <split>_metrics.npz, else val_metrics_best.npz) or as a metrics file.
+"neighbours" runs: the inverse-distance-weighted mean of the same casts (<split>_metrics_idw.npz) is added as a run.
 """
 from __future__ import annotations
 
@@ -114,6 +115,21 @@ def pooled_vertical(m, metric: str, v: int) -> np.ndarray:
     if metric == "spread_skill":
         return np.sqrt(pooled(m["v_spread"][v] ** 2, w, 1) / pooled(m["v_rmse_ensmean"][v] ** 2, w, 1))
     return pooled(m[f"v_{metric}"][v], w, 1)
+
+
+def row_ticks(m) -> List[str]:
+    """Row labels: the value, or for "neighbours" the distance bin ('0-10', '10-20', ...)."""
+    rows = [float(r) for r in m["rows"]]
+    if "nearest cast" in str(m["row_name"]):
+        return [f"{a:g}-{b:g}" for a, b in zip([0.0] + rows[:-1], rows)]
+    return [f"{r:g}" for r in rows]
+
+
+def row_text(m, i: int) -> str:
+    """'D_input 50 m', 'spacing 20 m', 'nearest cast 10-20 km' for row i."""
+    name, _, unit = str(m["row_name"]).partition(" (")
+    name = name.replace("distance to the nearest cast", "nearest cast")
+    return f"{name} {row_ticks(m)[i]} {unit.rstrip(')')}".strip()
 
 
 def grid_of(n: int, ncol: Optional[int] = None):
@@ -225,7 +241,7 @@ def fig_by_row(runs: Runs, metric: str = "crps"):
         u = unit(m0, v, metric)
         ax.set_title(LONG_NAMES.get(name, name) + (f" ({u})" if u else ""), fontsize=11)
         ax.set_xticks(np.arange(len(rows)))
-        ax.set_xticklabels([f"{r:g}" for r in rows], fontsize=8)
+        ax.set_xticklabels(row_ticks(m0), fontsize=8)
         ax.set_ylim(bottom=0)
     for ax in axes[-1]:
         ax.set_xlabel(str(m0["row_name"]))
@@ -251,7 +267,7 @@ def fig_heatmaps(m, coord: str, metric: str = "crps", other=None, max_depth: flo
         mesh = ax.pcolormesh(np.arange(len(rows) + 1) - 0.5, edges, np.ma.masked_invalid(data), cmap=cmap, norm=norm)
         ax.set_ylim(bottom, top)
         ax.set_xticks(np.arange(len(rows)))
-        ax.set_xticklabels([f"{r:g}" for r in rows], fontsize=8)
+        ax.set_xticklabels(row_ticks(m), fontsize=8)
         ax.grid(False)
         ax.set_title(LONG_NAMES.get(name, name), fontsize=11)
         fig.colorbar(mesh, ax=ax, fraction=0.05, pad=0.02, label=unit(m, v, metric))
@@ -280,9 +296,9 @@ def fig_rows(runs: Runs, v: int, coord: str, metric: str = "crps", rows_sel=None
             ax.plot(val, y, color=color, label=label)
         if coord == "depth" and "observed" in m0:
             ax.plot(np.zeros(int(m0["observed"][r].sum())), m0["level_depths"][m0["observed"][r]], "o", color=INK, ms=3)
-        elif coord == "depth":
+        elif coord == "depth" and str(m0["experiment"]) == "cutoff":
             ax.axhspan(0, rows[r], color=GRID, lw=0)
-        ax.set_title(f"{str(m0['row_name']).split(' (')[0]} {rows[r]:g} m", fontsize=10)
+        ax.set_title(row_text(m0, r), fontsize=10)
         ax.set_xlim(left=0)
     axes[0, 0].set_ylim(bottom, top)
     axes[0, 0].set_ylabel(vertical(m0, coord)[3], fontsize=9)
@@ -301,7 +317,7 @@ def fig_oxycline(runs: Runs):
         for (label, m), color in zip(runs, SERIES):
             ax.plot(np.arange(len(rows)), m[key], color=color, marker="o", label=label)
         ax.set_xticks(np.arange(len(rows)))
-        ax.set_xticklabels([f"{r:g}" for r in rows])
+        ax.set_xticklabels(row_ticks(m0))
         ax.set(xlabel=str(m0["row_name"]), ylabel=lab)
         ax.set_ylim(bottom=0)
     axes[0, 0].set_title("as a depth")
@@ -506,7 +522,8 @@ def fig_examples(ex: dict, max_depth: float = 250.0, max_members: int = 10):
         ax.set_xlabel("O$_2$ (mmol m$^{-3}$)")
     axes[0, 0].set_ylim(min(max_depth, float(ex["depth"][-1])), 0)
     axes[0, 0].legend(fontsize=7, loc="lower right")
-    fig.suptitle(f"O$_2$ members, {str(ex['row_name']).split(' (')[0]} {ex['row']:g} m", x=0.01, ha="left")
+    i = [float(r) for r in ex["rows"]].index(float(ex["row"]))
+    fig.suptitle(f"O$_2$ members, {row_text(ex, i)}", x=0.01, ha="left")
     fig.tight_layout()
     return fig
 
@@ -630,43 +647,51 @@ def cmd_data(processed_dir: str, year: int, step: int, out: Path, thr: float = 2
 
 
 # --------------------------------------------------------------------------------------- ensemble
-def cmd_ensemble(run: str, processed_dir: Optional[str], out: Path, row: Optional[float] = None, n_casts: int = 3, n_members: int = 50,
-                 split: str = "val", max_depth: float = 250.0, show: int = 20) -> None:
-    """Members of every variable for a few casts, in physical units (drift-shifted variables get their reference back)."""
+def cmd_ensemble(run: str, processed_dir: Optional[str], out: Path, row: Optional[float] = None, n_casts: int = 3,
+                 n_members: int = 50, split: str = "val", max_depth: float = 250.0, show: int = 20) -> None:
+    """Members of every variable for a few profiles, in physical units (drift-shifted variables get their reference
+    back). row: D_input / spacing (m), or for "neighbours" the number of casts given (grey; default as in training)."""
     import torch
 
-    from dataset import ProfileDataset, cutoff_levels, load_grid, resolve_splits, subtract_shallowest
+    from dataset import cutoff_levels, load_grid, make_dataset, resolve_splits, subtract_shallowest
     from metrics import fill_columns
     from model import aux_feature_indices
-    from train import drift_tensor, fgn_members, load_run, sparse_obs
+    from train import NEIGHBOUR_KEYS, drift_tensor, fgn_members, load_run, sparse_obs
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cfg, grid, stats, model = load_run(Path(run) / "best.pt", [f"processed_dir={processed_dir}"] if processed_dir else [],
                                        device)
     depth = np.asarray(grid["depth"])
-    row = row if row is not None else (20.0 if cfg.experiment == "sparse" else 50.0)
-    ds = ProfileDataset(cfg, grid, stats, resolve_splits(cfg, load_grid(cfg)["years"])[split], max_profiles=2000,
-                        seed=12345, in_memory=False, extras=True)
+    nb = cfg.experiment == "neighbours"
+    if nb:
+        cfg.neighbour_eval_casts = None if row is None else int(row)
+    else:
+        row = row if row is not None else (20.0 if cfg.experiment == "sparse" else 50.0)
+    ds = make_dataset(cfg, grid, stats, resolve_splits(cfg, load_grid(cfg)["years"])[split], False, max_profiles=2000,
+                      seed=12345, in_memory=False, extras=True)
     b = torch.utils.data.default_collate([ds[i] for i in range(len(ds))])
     b = {k: v.to(device) for k, v in b.items()}
-    keep = b["valid_len"] > int(np.searchsorted(depth, max_depth))
+    keep = (b["valid_len"] > int(np.searchsorted(depth, max_depth))) & ((b["src_len"] > 0).any(dim=1) if nb else True)
     pick = np.sort(np.random.default_rng(0).choice(int(keep.sum()), size=min(n_casts, int(keep.sum())), replace=False))
     b = {k: v[keep][torch.as_tensor(pick, device=device)] for k, v in b.items()}
     lev = torch.arange(len(depth), device=device)
-    if cfg.experiment == "sparse":
+    if nb:
+        obs = torch.zeros_like(b["x"][..., 0], dtype=torch.bool)
+    elif cfg.experiment == "sparse":
         obs = sparse_obs(cfg, model, b["valid_len"], torch.full_like(b["valid_len"], row, dtype=torch.float32))
     else:
         obs = (lev[None, :] < cutoff_levels(depth, [row], 1)[0][0]).expand(len(pick), -1)
     drift = drift_tensor(cfg, grid, device)
     x = b["x"] if drift is None else subtract_shallowest(b["x"], obs, b["valid_len"], drift)
+    inputs = (*[b[k] for k in NEIGHBOUR_KEYS], b["valid_len"], b["ctx"]) if nb else (x, obs, b["valid_len"], b["ctx"])
     gen = torch.Generator(device=device)
     gen.manual_seed(cfg.seed)
     with torch.no_grad():
-        o2, idx, mask, aux = fgn_members(model, (x, obs, b["valid_len"], b["ctx"]), n_members, 0, gen)
+        o2, idx, mask, aux = fgn_members(model, inputs, n_members, 0, gen)
     aux_names, aux_feat = aux_feature_indices(cfg, grid)
     var_names, feats = [grid["target"]] + aux_names, [grid["target_index"]] + aux_feat
     members = [o2] + [aux[..., a] for a in range(len(aux_names))]
-    shift = b["x_raw"] - x  # the drift reference removed from the model's values
+    shift = b["x_raw"] - x  # the drift reference removed from the model's values (the same for casts of that day)
     fig, axes = plt.subplots(len(pick), len(var_names), figsize=(2.3 * len(var_names) + 0.6, 2.9 * len(pick) + 0.8),
                              sharey="row", squeeze=False)
     for v, (name, f) in enumerate(zip(var_names, feats)):
@@ -677,6 +702,11 @@ def cmd_ensemble(run: str, processed_dir: Optional[str], out: Path, row: Optiona
         truth = truth.cpu().numpy()
         for c in range(len(pick)):
             ax, n = axes[c, v], int(b["valid_len"][c])
+            if nb:  # the given casts, down to the bottom of the predicted profile
+                for s in range(b["src_len"].shape[1]):
+                    ns = min(int(b["src_len"][c, s]), n)
+                    vals = ((b["src_x"][c, s, :ns, f] + shift[c, :ns, f]) * std + mean).cpu().numpy()
+                    ax.plot(vals, depth[:ns], color=MUTED, lw=1.0, label="given casts" if s == 0 else None)
             for mbr in cols[c, :show, :n]:
                 ax.plot(mbr, depth[:n], color=SERIES[0], lw=0.6, alpha=0.4)
             ax.plot(np.median(cols[c], axis=0)[:n], depth[:n], color=SERIES[0], lw=1.6, ls="--")
@@ -688,11 +718,17 @@ def cmd_ensemble(run: str, processed_dir: Optional[str], out: Path, row: Optiona
                 ax.set_title(LONG_NAMES.get(name, name), fontsize=10)
     for c in range(len(pick)):
         axes[c, 0].set_ylim(max_depth, 0)
-        axes[c, 0].set_ylabel(f"cast {c + 1}\ndepth (m)")
-    fig.suptitle(f"Members of every variable (blue; dashed = median), truth (black), observed (dots), "
-                 f"{'spacing' if cfg.experiment == 'sparse' else 'D_input'} {row:g} m", x=0.01, ha="left", fontsize=12)
+        if nb:
+            km = sorted(float(d) for d, n in zip(b["src_dxy"][c].norm(dim=-1).cpu(), b["src_len"][c].cpu()) if n > 0)
+            axes[c, 0].set_ylabel(f"profile {c + 1}: casts at\n{', '.join(f'{d:.0f}' for d in km)} km\ndepth (m)", fontsize=9)
+        else:
+            axes[c, 0].set_ylabel(f"cast {c + 1}\ndepth (m)")
+    what = ("given casts (grey)" if nb else "observed (dots), " + ("spacing" if cfg.experiment == "sparse" else "D_input")
+            + f" {row:g} m")
+    fig.suptitle(f"Members of every variable (blue; dashed = median), truth (black), {what}", x=0.01, ha="left",
+                 fontsize=12)
     fig.tight_layout()
-    save(fig, out, "ensemble_all_variables")
+    save(fig, out, "ensemble_all_variables" + (f"_{int(row)}casts" if nb and row is not None else ""))
 
 
 # --------------------------------------------------------------------------------------- drift diagnostic
@@ -781,7 +817,8 @@ def main() -> None:
         s.add_argument("--max-depth", type=float, default=300.0)
         s.add_argument("--rows", type=float, nargs="*", default=None, help="maps: pool only these D_input / spacings")
         s.add_argument("--min-count", type=float, default=20)
-        s.add_argument("--row", type=float, default=None, help="ensemble: D_input or spacing (default 50 / 20 m)")
+        s.add_argument("--row", type=float, default=None,
+                       help="ensemble: D_input or spacing (default 50 / 20 m); neighbours: number of casts")
         s.add_argument("--processed-dir", default=None)
     d = sub.add_parser("data")
     d.add_argument("--processed-dir", required=True)
@@ -804,6 +841,9 @@ def main() -> None:
     if a.cmd == "ensemble":
         return cmd_ensemble(str(run_dirs[0]), a.processed_dir, out, a.row, split=a.split)
     runs = [load(s, a.split) for s in a.runs]
+    idw = [q for q in (run_dirs[0] / f"{a.split}_metrics_idw.npz", run_dirs[0] / "val_metrics_idw.npz") if q.exists()]
+    if idw:  # "neighbours": the inverse-distance-weighted mean of the same casts, scored the same way
+        runs.append(load(f"IDW={idw[0]}"))
     rows = None if a.rows is None else [int(np.argmin(np.abs(runs[0][1]["rows"] - r))) for r in a.rows]
     if a.cmd in ("compare", "all"):
         cmd_compare(runs, out / "compare" if a.cmd == "all" else out, a.max_depth)

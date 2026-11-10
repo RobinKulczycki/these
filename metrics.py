@@ -1,8 +1,8 @@
 """
 Scores of the FGN ensemble, the same for every predicted variable: fair CRPS, error of the member median (MAE, RMSE,
-bias = median - truth), coverage of the member range, spread-skill. Accumulated per row (D_input or spacing) and
-model level, per bin of the TRUE sigma0 of the predicted point, per lat/lon cell and density layer, and per month;
-plus the oxycline (O2 < threshold) as a depth and as a density, from whole member profiles.
+bias = median - truth), coverage of the member range, spread-skill. Accumulated per row (D_input, spacing or distance
+to the nearest cast) and model level, per bin of the TRUE sigma0 of the predicted point, per lat/lon cell and density
+layer, and per month; plus the oxycline (O2 < threshold) as a depth and as a density, from whole member profiles.
 Evaluator.finish() returns everything as one dict of numpy arrays (saved as one .npz file, read by figures.py).
 """
 from __future__ import annotations
@@ -379,8 +379,9 @@ def scalars(r: Dict[str, np.ndarray], prefix: str) -> Dict[str, float]:
             for lab, p, c in zip(labels, pin, cnt):
                 if c > 0:
                     out[f"{base}/crps_layer/{lab}"] = float(2.0 * p / c * r["var_std"][v])
+    unit = str(r["row_name"]).rpartition("(")[2].rstrip(")")
     for i, row in enumerate(r["rows"]):
-        out[f"{prefix}/crps_by_row/{float(row):g}m"] = float(pooled(r["v_crps"][0][i], r["v_count"][0][i]))
+        out[f"{prefix}/crps_by_row/{float(row):g}{unit}"] = float(pooled(r["v_crps"][0][i], r["v_count"][0][i]))
     c = r["oxy_count"]
     if c.sum() > 0:
         for k in ("crps", "mae", "coverage", "crps_sigma", "mae_sigma", "coverage_sigma"):

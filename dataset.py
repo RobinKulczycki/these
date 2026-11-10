@@ -228,10 +228,14 @@ class ProfileDataset(Dataset):
     def __len__(self) -> int:
         return len(self.index) if self.index is not None else int(self.offsets[-1])
 
-    def __getitem__(self, i: int) -> dict:
+    def _locate(self, i: int) -> Tuple[int, int, int]:
+        """Dataset index -> (global index, year folder, index in the folder)."""
         g = int(self.index[i]) if self.index is not None else int(i)
         f = int(np.searchsorted(self.offsets, g, side="right") - 1)
-        j = g - int(self.offsets[f])
+        return g, f, g - int(self.offsets[f])
+
+    def _profile(self, f: int, j: int):
+        """Profile j of folder f -> x (standardised, drift removed, 0 below valid_len), x_raw or None, valid_len, ctx."""
         if self._arrays[f] is None:  # lazily memory-mapped inside each worker
             self._arrays[f] = self._load(f, mmap=True)
         prof, vlen, ctx = self._arrays[f]
@@ -241,11 +245,85 @@ class ProfileDataset(Dataset):
         if self.lagged:
             x[:, self.drift_idx] -= self._lag_ref[f][self._month_of[f][j]]
         x[n_valid:] = 0.0
+        if x_raw is not None:
+            x_raw[n_valid:] = 0.0
         c = np.nan_to_num((np.asarray(ctx[j], dtype=np.float32) - self.ctx_mean) / self.ctx_std, nan=0.0)
+        return x, x_raw, n_valid, c
+
+    def __getitem__(self, i: int) -> dict:
+        _, f, j = self._locate(i)
+        x, x_raw, n_valid, c = self._profile(f, j)
         out = {"x": torch.from_numpy(x), "valid_len": torch.tensor(n_valid, dtype=torch.long), "ctx": torch.from_numpy(c)}
         if self.extras:
-            x_raw[n_valid:] = 0.0
             lat, lon = self._latlon[f]
             out.update(x_raw=torch.from_numpy(x_raw), lat=torch.tensor(float(lat[j])), lon=torch.tensor(float(lon[j])),
                        month=torch.tensor(int(self._months[f][j]), dtype=torch.long))
         return out
+
+
+KM_PER_DEG = 111.2
+
+
+def nearest_index(axis: np.ndarray, values: np.ndarray) -> np.ndarray:
+    """Index of the nearest value of a sorted axis."""
+    j = np.clip(np.searchsorted(axis, values), 1, len(axis) - 1)
+    return np.where(np.abs(values - axis[j - 1]) <= np.abs(values - axis[j]), j - 1, j)
+
+
+class NeighbourDataset(ProfileDataset):
+    """Experiment "neighbours": every profile with 1..neighbour_casts other profiles of the same time step within
+    neighbour_max_km (the given casts): src_x (K, Z, F), src_len (K,) [0 = no cast], src_ctx (K, C), src_dxy (K, 2)
+    = km east / north of the predicted profile. train=False draws the same casts at every evaluation."""
+
+    def __init__(self, cfg: Config, grid: dict, stats: Dict[str, np.ndarray], years: Sequence[int], train: bool = True,
+                 max_profiles: Optional[int] = None, seed: int = 0, in_memory: bool = True, extras: bool = False):
+        super().__init__(cfg, grid, stats, years, max_profiles, seed, in_memory, extras)
+        self.train, self.seed = train, int(seed)
+        self.k_max, self.k_eval, self.max_km = int(cfg.neighbour_casts), cfg.neighbour_eval_casts, float(cfg.neighbour_max_km)
+        lat_ax, lon_ax = np.asarray(grid["lat"], dtype=np.float64), np.asarray(grid["lon"], dtype=np.float64)
+        step = lambda a: float(np.median(np.diff(a))) if a.size > 1 else 1.0  # noqa: E731
+        self.ry = int(np.ceil(self.max_km / (KM_PER_DEG * step(lat_ax))))
+        self.rx = int(np.ceil(self.max_km / (KM_PER_DEG * step(lon_ax) * np.cos(np.deg2rad(lat_ax.max())))))
+        self._ll, self._tyx, self._cell = [], [], []
+        for d in self.dirs:  # per year: (time step, row, column) of every profile and the profile of every cell
+            meta = np.load(d / "meta.npz")
+            lat, lon = meta["lat"].astype(np.float64), meta["lon"].astype(np.float64)
+            t = np.unique(meta["time"], return_inverse=True)[1].reshape(-1)
+            iy, ix = nearest_index(lat_ax, lat), nearest_index(lon_ax, lon)
+            cell = np.full((int(t.max()) + 1 if t.size else 0, len(lat_ax), len(lon_ax)), -1, dtype=np.int32)
+            cell[t, iy, ix] = np.arange(len(t), dtype=np.int32)
+            self._ll.append((lat, lon))
+            self._tyx.append(np.stack([t, iy, ix], axis=1).astype(np.int32))
+            self._cell.append(cell)
+
+    def __getitem__(self, i: int) -> dict:
+        out = super().__getitem__(i)
+        g, f, j = self._locate(i)
+        t, y, x = (int(v) for v in self._tyx[f][j])
+        cand = self._cell[f][t, max(y - self.ry, 0):y + self.ry + 1, max(x - self.rx, 0):x + self.rx + 1].reshape(-1)
+        cand = cand[(cand >= 0) & (cand != j)]
+        lat, lon = self._ll[f]
+        dy = (lat[cand] - lat[j]) * KM_PER_DEG
+        dx = (lon[cand] - lon[j]) * KM_PER_DEG * np.cos(np.deg2rad(lat[j]))
+        near = np.hypot(dx, dy) <= self.max_km
+        cand, dx, dy = cand[near], dx[near], dy[near]
+        rng = np.random.default_rng(int(torch.randint(2 ** 62, ())) if self.train else (self.seed, g))
+        k = min(int(self.k_eval or rng.integers(1, self.k_max + 1)), len(cand))
+        pick = np.sort(rng.choice(len(cand), size=k, replace=False))
+        nz, nf = out["x"].shape
+        src_x = np.zeros((self.k_max, nz, nf), dtype=np.float32)
+        src_len = np.zeros(self.k_max, dtype=np.int64)
+        src_ctx = np.zeros((self.k_max, out["ctx"].shape[0]), dtype=np.float32)
+        src_dxy = np.zeros((self.k_max, 2), dtype=np.float32)
+        for s, p in enumerate(pick):
+            src_x[s], _, src_len[s], src_ctx[s] = self._profile(f, int(cand[p]))
+            src_dxy[s] = dx[p], dy[p]
+        out.update(src_x=torch.from_numpy(src_x), src_len=torch.from_numpy(src_len), src_ctx=torch.from_numpy(src_ctx),
+                   src_dxy=torch.from_numpy(src_dxy))
+        return out
+
+
+def make_dataset(cfg: Config, grid: dict, stats, years, train: bool, **kw) -> ProfileDataset:
+    if cfg.experiment == "neighbours":
+        return NeighbourDataset(cfg, grid, stats, years, train=train, **kw)
+    return ProfileDataset(cfg, grid, stats, years, **kw)

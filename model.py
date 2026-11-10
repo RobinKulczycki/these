@@ -2,7 +2,8 @@
 FGN profile transformer (Alet et al. 2025, as in WeatherNext 2/3). Every LayerNorm is modulated by a noise vector z
 drawn once per member and shared by every level, so one draw is one coherent profile of O2 + auxiliary variables.
 
-  encoder  [context] [observed level] ...        observed levels: surface -> D_input ("cutoff") or anywhere ("sparse")
+  encoder  [context] [observed level] ...        observed levels: surface -> D_input ("cutoff") or anywhere ("sparse"),
+                                                 or every level of nearby casts ("neighbours")
   decoder  [query level] ...                     every unobserved valid level
   head     small MLP: O2 and every auxiliary variable per level and member
 """
@@ -269,6 +270,37 @@ class SparseFGN(_FGNBase):
         return o2, tgt_idx, ~tgt_pad, aux
 
 
+class NeighbourFGN(_FGNBase):
+    """Nearby casts of the same time step; members for every valid level of the profile at the target position.
+    Tokens: [target context] [cast context + offset] [cast level + offset]; offset = learned embedding of the
+    position of the cast relative to the target (km east, km north, distance)."""
+
+    OFFSET_SCALE_KM = 50.0
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        d = self.token_type.weight.shape[1]
+        self.offset_embed = nn.Sequential(nn.Linear(3, d), nn.GELU(), nn.Linear(d, d))
+
+    def forward(self, src_x, src_len, src_ctx, src_dxy, valid_len, ctx, n_members=2, noise=None):
+        """src_x (B, K, Z, F), src_len (B, K) [0 = no cast], src_ctx (B, K, C), src_dxy (B, K, 2) km, valid_len (B,),
+        ctx (B, C) of the target -> as CutoffFGN."""
+        bsz, k = src_len.shape
+        zs, zt = max(1, int(src_len.max())), int(valid_len.max())
+        lev = torch.arange(max(zs, zt), device=src_x.device)
+        dxy = src_dxy.float() / self.OFFSET_SCALE_KM
+        off = self.offset_embed(torch.cat([dxy, dxy.norm(dim=-1, keepdim=True)], dim=-1))  # (B, K, d)
+        casts = self.context_embed(src_ctx) + off + self.token_type.weight[self.CONTEXT]
+        levels = (self.feature_embed(src_x[:, :, :zs]) + self.abs_depth(self.depth[:zs])[None, None] + off[:, :, None]
+                  + self.token_type.weight[self.OBSERVED]).reshape(bsz, k * zs, -1)
+        pad = torch.cat([src_len == 0, (lev[None, None, :zs] >= src_len[..., None]).reshape(bsz, k * zs)], dim=1)
+        src, src_pad = self._source(torch.cat([casts, levels], dim=1), pad, ctx)
+        target_mask = lev[None, :zt] < valid_len[:, None]
+        queries = (self.abs_depth(self.depth[:zt]) + self.token_type.weight[self.QUERY])[None].expand(bsz, -1, -1)
+        o2, aux = self._members(src, src_pad, queries, ~target_mask, n_members, noise)
+        return o2, lev[None, :zt].expand(bsz, -1), target_mask, aux
+
+
 def aux_lower_bounds(cfg, grid: dict, stats) -> List[Optional[float]]:
     """Physical 0 in standardised units for the bounded auxiliary variables (nonnegative_vars, not drift-shifted,
     not log-transformed), else None."""
@@ -284,7 +316,7 @@ def aux_lower_bounds(cfg, grid: dict, stats) -> List[Optional[float]]:
 def build_model(cfg, grid: dict, stats) -> _FGNBase:
     ti = grid["target_index"]
     lower = -float(stats["mean"][ti]) / float(stats["std"][ti]) if cfg.enforce_nonnegative else None
-    cls = SparseFGN if cfg.experiment == "sparse" else CutoffFGN
+    cls = {"sparse": SparseFGN, "neighbours": NeighbourFGN}.get(cfg.experiment, CutoffFGN)
     return cls(n_features=len(grid["features"]), n_context=len(grid["context"]), depth_levels=grid["depth"],
                d_model=cfg.d_model, n_heads=cfg.n_heads, n_enc_layers=cfg.n_enc_layers, n_dec_layers=cfg.n_dec_layers,
                d_ff=cfg.d_ff, dropout=cfg.dropout, n_depth_freqs=cfg.n_depth_freqs,
