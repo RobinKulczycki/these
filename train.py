@@ -261,23 +261,23 @@ class Task:
         return loss_o2, (per_feature * mask.unsqueeze(-1)).sum(dim=(0, 1)) / n_real
 
 
-def fgn_members(net, inputs: tuple, n_members: int, chunk: int = 0, generator=None, shared_noise=None):
+def fgn_members(net, inputs: tuple, n_members: int, chunk: int = 0, generator=None, noise=None):
     """All members of one batch, drawn `chunk` at a time: O2 (B, M, T), idx, mask, other variables (B, M, T, A) or
-    None. Every profile draws its own noise, unless shared_noise (M, noise_dim) is given: then member m uses the
-    same draw in every profile, which makes it one coherent field (figures.py field)."""
+    None. Every profile draws its own noise, unless it is given: noise (M, noise_dim) = member m uses the same draw
+    in every profile, which makes it one coherent field (figures.py field); or (B, M, noise_dim), one per profile."""
     bsz = inputs[0].shape[0]
     casts = inputs[0].shape[1] + 1 if inputs[0].dim() == 4 else 1  # "neighbours": about (K + 1) x longer sequences
     step = max(1, min(n_members, FGN_MAX_SEQUENCES // max(bsz * casts, 1))) if chunk <= 0 else min(chunk, n_members)
     o2, aux, out = [], [], None
     for start in range(0, n_members, step):
         m = min(step, n_members - start)
-        if shared_noise is not None:
-            noise = shared_noise[None, start:start + m].expand(bsz, -1, -1)
+        if noise is not None:
+            z = (noise[None] if noise.dim() == 2 else noise)[:, start:start + m].expand(bsz, -1, -1)
         elif generator is not None:
-            noise = torch.randn(bsz, m, net.noise_dim, generator=generator, device=generator.device)
+            z = torch.randn(bsz, m, net.noise_dim, generator=generator, device=generator.device)
         else:
-            noise = None
-        out = net(*inputs, n_members=m, noise=noise)
+            z = None
+        out = net(*inputs, n_members=m, noise=z)
         o2.append(out[0])
         aux.append(out[3])
     return torch.cat(o2, dim=1), out[1], out[2], (torch.cat(aux, dim=1) if aux[0] is not None else None)

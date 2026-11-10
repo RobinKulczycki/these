@@ -2,7 +2,7 @@
 """
 Checks that the code works end to end.
 
-    python test.py                 synthetic data on CPU (~5 min): every experiment and drift mode, resume,
+    python test.py                 synthetic data on CPU (~7 min): every experiment and drift mode, resume,
                                    evaluation, DDP, old-checkpoint handling and every figure command
     python test.py --check-run $R/v3_fgn_lag $R/v2_s_fgn_eq --processed-dir $D      (GPU job)
                                    re-evaluates runs trained by older code and compares with the scores that code
@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -134,6 +135,11 @@ def synthetic(tmp: Path) -> None:
     check(np.isfinite(r["objective"]) and (r["v_count"].sum(axis=(1, 2)) > 0).all(), "every variable scored")
     check(np.isfinite(r["v_crps"][r["v_count"] > 0]).all() and r["m_count"].sum() > 0 and r["t_count"].sum() > 0,
           "depth / density / map / monthly scores")
+    n = r["v_count"][0].sum()
+    check(r["s_count"].sum() == n and r["ms_count"].sum() == n and np.allclose(r["rank"].sum(axis=(1, 2)), n),
+          "calendar-month, seasonal-map and rank-histogram scores count the same points")
+    check(np.isfinite(r["coh_levels"]).all() and (r["coh_levels"][:, 1] > 0).all() and r["coh_variables"].shape[2:] == (9, 9),
+          "coherence scores (between levels, between variables)")
     check(any(f.startswith("basin_monthly_") for f in os.listdir(data)), "lagged reference cached")
     out = train("cut", "experiment=cutoff", "input_drift_mode=lagged", "variable_weighting=o2", epochs=3)
     ck = torch.load(runs / "cut" / "last.pt", map_location="cpu", weights_only=False)
@@ -152,7 +158,7 @@ def synthetic(tmp: Path) -> None:
     print("experiment 3 (neighbours), lagged drift")
     nb = ["experiment=neighbours", "input_drift_mode=lagged", "neighbour_max_km=100", "neighbour_val_km=(40,70,100)"]
     train("nb", *nb)
-    r, idw = metrics(runs / "nb" / "val_metrics_best.npz"), metrics(runs / "nb" / "val_metrics_idw.npz")
+    r, idw = metrics(runs / "nb" / "val_metrics_best.npz"), metrics(runs / "nb" / "val_metrics_best_idw.npz")
     check(str(r["experiment"]) == "neighbours" and (r["v_count"][0].sum(axis=1) > 0).all(), "scores per distance row")
     check(np.array_equal(r["v_count"], idw["v_count"]) and int(idw["n_members"]) == 1,
           "IDW baseline scored on the same points")
@@ -161,6 +167,15 @@ def synthetic(tmp: Path) -> None:
     run("train.py", "--eval-only", "--split", "val", "--max-profiles", 200, "--tag", "1cast", "--set", f"processed_dir={data}",
         f"ckpt_dir={runs / 'nb'}", "neighbour_eval_casts=1")
     check((runs / "nb" / "val_metrics_1cast_idw.npz").exists(), "evaluation with exactly one cast (--tag)")
+    sys.path.insert(0, str(CODE))
+    from config import Config, apply_overrides
+    from dataset import NeighbourDataset, load_grid, load_or_compute_stats
+
+    cfg = apply_overrides(Config(), [f"processed_dir={data}", "neighbour_max_km=100", "neighbour_eval_casts=1"])
+    ds = [NeighbourDataset(cfg, load_grid(cfg), load_or_compute_stats(cfg, load_grid(cfg), [2000, 2001, 2002, 2003, 2004]),
+                           [2005], train=train, in_memory=False) for train in (True, False)]
+    casts = [[int((d[i]["src_len"] > 0).sum()) for i in range(0, 400, 7)] for d in ds]
+    check(max(casts[0]) > 1 and max(casts[1]) == 1, "neighbour_eval_casts applies to evaluation only")
     train("nb_bad", *nb, "input_drift_mode=shallowest", epochs=1, ok=False)
     check(True, "neighbours + shallowest drift is refused")
 
@@ -198,15 +213,25 @@ def synthetic(tmp: Path) -> None:
     run("figures.py", "compare", f"1 cast={runs / 'nb' / 'val_metrics_1cast.npz'}", f"1-4 casts={runs / 'nb'}",
         "--out", figs / "nb_casts")
     run("figures.py", "ensemble", runs / "nb", "--row", 1, "--out", figs / "nb")
+    out = run("figures.py", "field", runs / "nb", "--station-km", 90, "--out", figs / "nb_field")
+    run("figures.py", "field", runs / "nb", "--station-km", 90, "--noise-km", 150, "--out", figs / "nb_field")
+    line = next(x for x in out.splitlines() if "next to each other" in x)  # real error, members, noise per profile
+    c = [float(x) for x in re.findall(r"-?\d+\.\d\d", line.split("):")[1])]
+    check(c[1] > 0.5 > abs(c[2]), f"field: members sharing their noise are coherent between profiles ({c[1]:.2f}), "
+                                  f"members with their own noise are not ({c[2]:.2f})")
+    old = {k: v for k, v in metrics(runs / "cut" / "val_metrics.npz").items() if k.split("_")[0] not in ("s", "ms", "rank", "coh")}
+    np.savez(runs / "cut_old_metrics.npz", **old)
+    run("figures.py", "compare", runs / "cut_old_metrics.npz", "--out", figs / "old_file")
+    run("figures.py", "maps", runs / "cut_old_metrics.npz", "--out", figs / "old_file")
     run("figures.py", "drift", "--processed-dir", data, "--out", figs / "drift", "--runs", f"cut={runs / 'cut'}",
         "--set", "train_years=(2000,2001,2002,2003,2004)", "val_years=(2005,)", "test_years=(2006,2007)")
     n = {d.name: len(list(d.rglob("*.png"))) for d in figs.iterdir()}
-    check(n["cut"] >= 56 and n["sparse"] >= 52 and n["test_maps"] >= 22 and n["drift"] == 2 and n["nb"] >= 53
-          and n["nb_casts"] >= 28, f"figures written {n}")
+    check(n["cut"] >= 73 and n["sparse"] >= 69 and n["test_maps"] >= 31 and n["drift"] == 2 and n["nb"] >= 71
+          and n["nb_casts"] >= 36 and n["nb_field"] == 2 and n["old_file"] >= 50, f"figures written {n}")
     import figures
 
     figs_wandb = figures.wandb_figures(metrics(runs / "cut" / "val_metrics.npz"), True, None)
-    check(len(figs_wandb) >= 12, f"{len(figs_wandb)} W&B figures")
+    check(len(figs_wandb) >= 16, f"{len(figs_wandb)} W&B figures")
     print(f"\nALL CHECKS PASSED (figures in {figs})")
 
 

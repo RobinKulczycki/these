@@ -72,6 +72,7 @@ class Config:
     test_years: Sequence[int] = (2022, 2023, 2024)
 
     # ---- experiment: "cutoff" = observed from the surface down to D_input; "sparse" = observed every `spacing` m;
+    #      "neighbours" = nothing observed, 1..neighbour_casts casts of the same time step within neighbour_max_km
     experiment: str = "cutoff"
     min_input_levels: int = 1
     max_input_depth_m: Optional[float] = 150.0
@@ -80,7 +81,6 @@ class Config:
     sparse_val_spacings_m: Tuple[float, ...] = (10.0, 20.0, 30.0, 50.0)
     sparse_first_depth_m: Optional[float] = None  # None = one spacing below the surface
     sparse_max_obs_depth_m: Optional[float] = None
-    # "neighbours" = a whole profile from 1..neighbour_casts casts of the same time step within neighbour_max_km
     neighbour_casts: int = 4
     neighbour_max_km: float = 50.0
     neighbour_eval_casts: Optional[int] = None  # evaluation: exactly this many casts (None: as in training)

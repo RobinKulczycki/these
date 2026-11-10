@@ -285,6 +285,7 @@ class NeighbourDataset(ProfileDataset):
         self.k_eval = None if train else cfg.neighbour_eval_casts  # evaluation only: exactly this many casts
         lat_ax, lon_ax = np.asarray(grid["lat"], dtype=np.float64), np.asarray(grid["lon"], dtype=np.float64)
         step = lambda a: float(np.median(np.diff(a))) if a.size > 1 else 1.0  # noqa: E731
+        self.cell_km = (KM_PER_DEG * step(lat_ax), KM_PER_DEG * step(lon_ax) * np.cos(np.deg2rad(lat_ax.mean())))
         self.ry = int(np.ceil(self.max_km / (KM_PER_DEG * step(lat_ax))))
         self.rx = int(np.ceil(self.max_km / (KM_PER_DEG * step(lon_ax) * np.cos(np.deg2rad(lat_ax.max())))))
         self._ll, self._tyx, self._cell = [], [], []
@@ -335,20 +336,26 @@ class NeighbourDataset(ProfileDataset):
         pick = np.sort(rng.choice(len(cand), size=k, replace=False))
         return self.sample(f, j, cand[pick], dx[pick], dy[pick])
 
-    def field(self, f: int, t: int, stations: np.ndarray) -> Tuple[dict, np.ndarray]:
-        """One map: every other profile of time step t of folder f that has a station within max_km, each given its
-        (at most neighbour_casts) nearest stations -> (batch, indices of these profiles in the folder)."""
-        cell = np.full_like(self._cell[f][t], -1)
-        _, sy, sx = self._tyx[f][stations].T
-        cell[sy, sx] = stations
-        items, targets = [], []
-        for j in np.setdiff1d(np.nonzero(self._tyx[f][:, 0] == t)[0], stations):
+    def field(self, f: int, t: int, station_km: float) -> Tuple[dict, np.ndarray, np.ndarray]:
+        """One map of time step t of folder f. Stations = its profiles on a regular sub-grid about station_km apart;
+        every other profile with a station within max_km is predicted from its (at most neighbour_casts) nearest
+        stations -> (batch of these profiles, lat of the stations, lon of the stations)."""
+        tyx = self._tyx[f]
+        here = np.nonzero(tyx[:, 0] == min(t, int(tyx[:, 0].max())))[0]
+        every_y, every_x = (max(1, int(round(station_km / km))) for km in self.cell_km)
+        stations = here[(tyx[here, 1] % every_y == 0) & (tyx[here, 2] % every_x == 0)]
+        cell = np.full(self._cell[f].shape[1:], -1, dtype=np.int32)
+        cell[tyx[stations, 1], tyx[stations, 2]] = stations
+        items = []
+        for j in np.setdiff1d(here, stations):
             cand, dx, dy = self.around(f, int(j), cell)
-            if len(cand):
-                near = np.argsort(np.hypot(dx, dy))[:self.k_max]
+            near = np.argsort(np.hypot(dx, dy))[:self.k_max]
+            if len(near):
                 items.append(self.sample(f, int(j), cand[near], dx[near], dy[near]))
-                targets.append(int(j))
-        return torch.utils.data.default_collate(items), np.asarray(targets)
+        if not items:
+            raise SystemExit(f"no profile has a station within {self.max_km:g} km: lower --station-km")
+        lat, lon = self._ll[f]
+        return torch.utils.data.default_collate(items), lat[stations], lon[stations]
 
 
 def make_dataset(cfg: Config, grid: dict, stats, years, train: bool, **kw) -> ProfileDataset:
