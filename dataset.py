@@ -251,7 +251,9 @@ class ProfileDataset(Dataset):
         return x, x_raw, n_valid, c
 
     def __getitem__(self, i: int) -> dict:
-        _, f, j = self._locate(i)
+        return self._item(*self._locate(i)[1:])
+
+    def _item(self, f: int, j: int) -> dict:
         x, x_raw, n_valid, c = self._profile(f, j)
         out = {"x": torch.from_numpy(x), "valid_len": torch.tensor(n_valid, dtype=torch.long), "ctx": torch.from_numpy(c)}
         if self.extras:
@@ -279,7 +281,8 @@ class NeighbourDataset(ProfileDataset):
                  max_profiles: Optional[int] = None, seed: int = 0, in_memory: bool = True, extras: bool = False):
         super().__init__(cfg, grid, stats, years, max_profiles, seed, in_memory, extras)
         self.train, self.seed = train, int(seed)
-        self.k_max, self.k_eval, self.max_km = int(cfg.neighbour_casts), cfg.neighbour_eval_casts, float(cfg.neighbour_max_km)
+        self.k_max, self.max_km = int(cfg.neighbour_casts), float(cfg.neighbour_max_km)
+        self.k_eval = None if train else cfg.neighbour_eval_casts  # evaluation only: exactly this many casts
         lat_ax, lon_ax = np.asarray(grid["lat"], dtype=np.float64), np.asarray(grid["lon"], dtype=np.float64)
         step = lambda a: float(np.median(np.diff(a))) if a.size > 1 else 1.0  # noqa: E731
         self.ry = int(np.ceil(self.max_km / (KM_PER_DEG * step(lat_ax))))
@@ -296,31 +299,56 @@ class NeighbourDataset(ProfileDataset):
             self._tyx.append(np.stack([t, iy, ix], axis=1).astype(np.int32))
             self._cell.append(cell)
 
-    def __getitem__(self, i: int) -> dict:
-        out = super().__getitem__(i)
-        g, f, j = self._locate(i)
+    def around(self, f: int, j: int, cell: Optional[np.ndarray] = None):
+        """Profiles of the same time step within max_km of profile j of folder f -> (indices, km east, km north).
+        cell (ny, nx): look only among these profiles (default: every profile of the time step)."""
         t, y, x = (int(v) for v in self._tyx[f][j])
-        cand = self._cell[f][t, max(y - self.ry, 0):y + self.ry + 1, max(x - self.rx, 0):x + self.rx + 1].reshape(-1)
+        cell = self._cell[f][t] if cell is None else cell
+        cand = cell[max(y - self.ry, 0):y + self.ry + 1, max(x - self.rx, 0):x + self.rx + 1].reshape(-1)
         cand = cand[(cand >= 0) & (cand != j)]
         lat, lon = self._ll[f]
         dy = (lat[cand] - lat[j]) * KM_PER_DEG
         dx = (lon[cand] - lon[j]) * KM_PER_DEG * np.cos(np.deg2rad(lat[j]))
         near = np.hypot(dx, dy) <= self.max_km
-        cand, dx, dy = cand[near], dx[near], dy[near]
-        rng = np.random.default_rng(int(torch.randint(2 ** 62, ())) if self.train else (self.seed, g))
-        k = min(int(self.k_eval or rng.integers(1, self.k_max + 1)), len(cand))
-        pick = np.sort(rng.choice(len(cand), size=k, replace=False))
+        return cand[near], dx[near], dy[near]
+
+    def sample(self, f: int, j: int, casts: np.ndarray, dx: np.ndarray, dy: np.ndarray) -> dict:
+        """Profile j of folder f (as ProfileDataset) with the given casts (at most neighbour_casts)."""
+        out = self._item(f, j)
         nz, nf = out["x"].shape
         src_x = np.zeros((self.k_max, nz, nf), dtype=np.float32)
         src_len = np.zeros(self.k_max, dtype=np.int64)
         src_ctx = np.zeros((self.k_max, out["ctx"].shape[0]), dtype=np.float32)
         src_dxy = np.zeros((self.k_max, 2), dtype=np.float32)
-        for s, p in enumerate(pick):
-            src_x[s], _, src_len[s], src_ctx[s] = self._profile(f, int(cand[p]))
-            src_dxy[s] = dx[p], dy[p]
+        for s, c in enumerate(casts):
+            src_x[s], _, src_len[s], src_ctx[s] = self._profile(f, int(c))
+            src_dxy[s] = dx[s], dy[s]
         out.update(src_x=torch.from_numpy(src_x), src_len=torch.from_numpy(src_len), src_ctx=torch.from_numpy(src_ctx),
                    src_dxy=torch.from_numpy(src_dxy))
         return out
+
+    def __getitem__(self, i: int) -> dict:
+        g, f, j = self._locate(i)
+        cand, dx, dy = self.around(f, j)
+        rng = np.random.default_rng(int(torch.randint(2 ** 62, ())) if self.train else (self.seed, g))
+        k = min(int(self.k_eval or rng.integers(1, self.k_max + 1)), len(cand))
+        pick = np.sort(rng.choice(len(cand), size=k, replace=False))
+        return self.sample(f, j, cand[pick], dx[pick], dy[pick])
+
+    def field(self, f: int, t: int, stations: np.ndarray) -> Tuple[dict, np.ndarray]:
+        """One map: every other profile of time step t of folder f that has a station within max_km, each given its
+        (at most neighbour_casts) nearest stations -> (batch, indices of these profiles in the folder)."""
+        cell = np.full_like(self._cell[f][t], -1)
+        _, sy, sx = self._tyx[f][stations].T
+        cell[sy, sx] = stations
+        items, targets = [], []
+        for j in np.setdiff1d(np.nonzero(self._tyx[f][:, 0] == t)[0], stations):
+            cand, dx, dy = self.around(f, int(j), cell)
+            if len(cand):
+                near = np.argsort(np.hypot(dx, dy))[:self.k_max]
+                items.append(self.sample(f, int(j), cand[near], dx[near], dy[near]))
+                targets.append(int(j))
+        return torch.utils.data.default_collate(items), np.asarray(targets)
 
 
 def make_dataset(cfg: Config, grid: dict, stats, years, train: bool, **kw) -> ProfileDataset:

@@ -2,7 +2,9 @@
 Scores of the FGN ensemble, the same for every predicted variable: fair CRPS, error of the member median (MAE, RMSE,
 bias = median - truth), coverage of the member range, spread-skill. Accumulated per row (D_input, spacing or distance
 to the nearest cast) and model level, per bin of the TRUE sigma0 of the predicted point, per lat/lon cell and density
-layer, and per month; plus the oxycline (O2 < threshold) as a depth and as a density, from whole member profiles.
+layer, per month of the record, per calendar month and level, and per season and lat/lon cell. Plus the rank
+histogram (calibration), the coherence of the members (between levels and between variables) and the oxycline
+(O2 < threshold) as a depth and as a density, from whole member profiles.
 Evaluator.finish() returns everything as one dict of numpy arrays (saved as one .npz file, read by figures.py).
 """
 from __future__ import annotations
@@ -25,6 +27,7 @@ SHORT_NAMES = {"o2": "O$_2$", "thetao": "T", "so": "S", "sigma0": "$\\sigma_0$",
 POINT_KEYS = ("pinball", "abs_err", "sq_err", "bias", "covered", "ens_var", "sq_err_mean")
 MAP_KEYS = ("pinball", "bias", "abs_err", "covered", "ens_var", "sq_err_mean")
 TIME_KEYS = ("pinball", "bias", "abs_err")
+SEASON_KEYS = ("pinball", "bias")
 
 
 def _all_reduce(tensors) -> None:
@@ -77,6 +80,38 @@ def point_metrics(samples: torch.Tensor, y: torch.Tensor, tol: float) -> Dict[st
             "sq_err": (y - median) ** 2, "bias": median - y,
             "covered": (y >= srt[:, 0] - tol) & (y <= srt[:, -1] + tol),
             "ens_var": ((samples - mean.unsqueeze(1)) ** 2).sum(dim=1) / max(m - 1, 1), "sq_err_mean": (y - mean) ** 2}
+
+
+def truth_rank(samples: torch.Tensor, y: torch.Tensor, tol: float, generator) -> torch.Tensor:
+    """Rank of the truth among the M members, 0..M (B, T). A calibrated ensemble gives every rank equally often.
+    Members within tol of the truth are ties, broken at random (an O2 of exactly 0 in the anoxic layer)."""
+    below = (samples < (y - tol).unsqueeze(1)).sum(dim=1)
+    ties = ((samples - y.unsqueeze(1)).abs() <= tol).sum(dim=1)
+    return below + (torch.rand(y.shape, generator=generator, device=y.device) * (ties + 1)).long()
+
+
+def coherence_sums(members: torch.Tensor, truth: torch.Tensor, idx: torch.Tensor, mask: torch.Tensor, generator):
+    """What the coherence of the members is worth. members (B, M, T, V), truth (B, T, V), standardised.
+    The members are scored on quantities that depend on their coherence: the difference between two consecutive
+    levels, and the difference between two variables at a level. The same is done after shuffling the members
+    independently at every level and variable, which keeps every error bar but destroys the coherence.
+    -> summed CRPS [as predicted, shuffled] of the level differences (2, V) and of every pair of variables (2, P)."""
+    shuffled = members.gather(1, torch.rand(members.shape, generator=generator, device=members.device).argsort(dim=1))
+    step = (mask[:, 1:] & mask[:, :-1] & (idx[:, 1:] == idx[:, :-1] + 1))[..., None]  # two consecutive predicted levels
+    a, b = torch.triu_indices(members.shape[-1], members.shape[-1], offset=1, device=members.device)
+    levels, pairs = [], []
+    for e in (members, shuffled):
+        levels.append((crps_ensemble(e[:, :, 1:] - e[:, :, :-1], truth[:, 1:] - truth[:, :-1]) * step).sum(dim=(0, 1)))
+        pairs.append((crps_ensemble(e[..., a] - e[..., b], truth[..., a] - truth[..., b]) * mask[..., None]).sum(dim=(0, 1)))
+    return torch.stack(levels).double(), torch.stack(pairs).double()
+
+
+def coherence(sums: np.ndarray) -> np.ndarray:
+    """Sums of coherence_sums per row (rows, 2, ...), pooled over the rows -> 1 - CRPS as predicted / CRPS shuffled:
+    0 = the members are worth no more than independent draws, 1 = perfect, < 0 = their coherence is wrong."""
+    s = np.asarray(sums, dtype=np.float64).sum(axis=0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return 1.0 - s[0] / s[1]
 
 
 # --------------------------------------------------------------------------------------- whole profiles
@@ -161,33 +196,7 @@ class OxyclineAccumulator:
         return {"ok": ok, "crps": crps, "abs_err": abs_err, "covered": covered}
 
 
-# --------------------------------------------------------------------------------------- accumulators
-class GridAccumulator:
-    """Sums of the point metrics on a (rows x columns) grid; columns = model levels or density bins."""
-
-    def __init__(self, n_rows: int, n_cols: int, device):
-        self.sums = {k: torch.zeros(n_rows, n_cols, dtype=torch.float64, device=device)
-                     for k in POINT_KEYS + ("count",)}
-
-    @torch.no_grad()
-    def update(self, row: int, col: torch.Tensor, mask: torch.Tensor, metrics: Dict[str, torch.Tensor]) -> None:
-        m = mask.reshape(-1)
-        c = col.reshape(-1)[m]
-        for name, val in {**metrics, "count": torch.ones_like(mask, dtype=torch.float64)}.items():
-            self.sums[name][row].index_add_(0, c, val.reshape(-1)[m].double())
-
-    def results(self, std: float, n_members: int) -> Dict[str, np.ndarray]:
-        s = {k: v.cpu().numpy() for k, v in self.sums.items()}
-        n = s["count"]
-        corr = (n_members + 1.0) / n_members
-        with np.errstate(invalid="ignore", divide="ignore"):
-            return {"count": n, "crps": 2.0 * s["pinball"] / n * std, "mae": s["abs_err"] / n * std,
-                    "rmse": np.sqrt(s["sq_err"] / n) * std, "bias": s["bias"] / n * std, "coverage": s["covered"] / n,
-                    "spread": np.sqrt(corr * s["ens_var"] / n) * std,
-                    "rmse_ensmean": np.sqrt(s["sq_err_mean"] / n) * std,
-                    "spread_skill": np.sqrt(corr * s["ens_var"] / n) / np.sqrt(s["sq_err_mean"] / n)}
-
-
+# --------------------------------------------------------------------------------------- bins and weights
 def density_edges(cfg) -> np.ndarray:
     lo, hi = (float(v) for v in cfg.density_range)
     w = float(cfg.density_bin_width)
@@ -223,8 +232,27 @@ def combine_losses(cfg, loss_o2, loss_aux, weights=None):
 
 
 # --------------------------------------------------------------------------------------- evaluator
+def scores(s: Dict[str, np.ndarray], n: np.ndarray, std: np.ndarray, n_members: int) -> Dict[str, np.ndarray]:
+    """Sums of the point metrics (variable, ...) and the number of points (...) -> scores in physical units."""
+    std = std.reshape((-1,) + (1,) * n.ndim)
+    corr = (n_members + 1.0) / n_members
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return {"count": np.broadcast_to(n, s["pinball"].shape).copy(), "crps": 2.0 * s["pinball"] / n * std,
+                "mae": s["abs_err"] / n * std, "rmse": np.sqrt(s["sq_err"] / n) * std, "bias": s["bias"] / n * std,
+                "coverage": s["covered"] / n, "spread": np.sqrt(corr * s["ens_var"] / n) * std,
+                "rmse_ensmean": np.sqrt(s["sq_err_mean"] / n) * std,
+                "spread_skill": np.sqrt(corr * s["ens_var"] / n) / np.sqrt(s["sq_err_mean"] / n)}
+
+
 class Evaluator:
-    """Accumulates every score of one evaluation. update() once per (batch, row); finish() -> arrays."""
+    """Accumulates every score of one evaluation. update() once per (batch, row); finish() -> arrays.
+
+    A score is a sum over the scored points (a level of a profile), kept in bins. The same points are binned in
+    several ways, the "views" (prefix of the arrays in the metrics file):
+      v   row x model level                        d   row x bin of the true sigma0
+      m   row x water-mass layer x map cell        t   row x water-mass layer x month of the record
+      s   calendar month x model level             ms  season (DJF, MAM, JJA, SON) x map cell
+    plus the rank histogram, the coherence of the members and the oxycline."""
 
     def __init__(self, cfg, grid: dict, stats, rows: Sequence[float], row_name: str, device):
         self.cfg, self.rows, self.row_name = cfg, list(rows), row_name
@@ -239,7 +267,7 @@ class Evaluator:
         self.tol = float(cfg.coverage_tol_mmol_m3) / self.o2_std  # standardised, the same for every variable
         self.n_members = int(cfg.fgn_eval_members)
         nv, nz = len(self.names), len(grid["depth"])
-        self.depth_acc = [GridAccumulator(n_rows, nz, device) for _ in self.names]
+        # density bins and water-mass layers, from the true sigma0 of every point
         self.si = feats.index("sigma0") if "sigma0" in feats else None
         self.edges = density_edges(cfg) if self.si is not None else np.zeros(0)
         self.layer_edges = np.asarray(cfg.density_layers if self.si is not None else (), dtype=np.float64)
@@ -247,9 +275,7 @@ class Evaluator:
             self.sig_mean, self.sig_std = float(stats["mean"][self.si]), float(stats["std"][self.si])
             self._inner = torch.as_tensor(self.edges[1:-1], dtype=torch.float32, device=device)
             self._layers = torch.as_tensor(self.layer_edges, dtype=torch.float32, device=device)
-        self.dens_acc = [GridAccumulator(n_rows, len(self.edges) - 1, device) for _ in self.names] if self.si is not None else []
-        self.oxy = OxyclineAccumulator(n_rows, device, cfg.oxycline_o2_threshold)
-        # maps: cells = blocks of whole model columns, edges halfway between grid points
+        # map cells = blocks of whole model columns, edges halfway between grid points
         lat, lon = np.asarray(grid["lat"], dtype=np.float64), np.asarray(grid["lon"], dtype=np.float64)
         dlat, dlon = (float(np.median(np.diff(a))) if a.size > 1 else float(cfg.map_resolution_deg) for a in (lat, lon))
         self.res_lat = max(1, int(round(cfg.map_resolution_deg / dlat))) * dlat
@@ -257,93 +283,129 @@ class Evaluator:
         self.lat0, self.lon0 = lat.min() - dlat / 2, lon.min() - dlon / 2
         self.ny = int(np.floor((lat.max() - self.lat0) / self.res_lat)) + 1
         self.nx = int(np.floor((lon.max() - self.lon0) / self.res_lon)) + 1
-        nl, nc = len(self.layer_edges) + 1, self.ny * self.nx
-        self.maps = {k: torch.zeros(nv, n_rows, nl * nc, dtype=torch.float64, device=device) for k in MAP_KEYS}
-        self.map_count = torch.zeros(n_rows, nl * nc, dtype=torch.float64, device=device)
-        self.map_oxy = {k: torch.zeros(n_rows, nc, dtype=torch.float64, device=device)
-                        for k in ("crps", "abs_err", "covered", "count")}
         # months of every processed year
         years = sorted(int(y) for y in grid["years"])
         self.month0, self.n_t = (years[0] - 1970) * 12, (years[-1] - years[0] + 1) * 12
-        self.times = {k: torch.zeros(nv, n_rows, nl * self.n_t, dtype=torch.float64, device=device) for k in TIME_KEYS}
-        self.time_count = torch.zeros(n_rows, nl * self.n_t, dtype=torch.float64, device=device)
+
+        nl, nc = len(self.layer_edges) + 1, self.ny * self.nx
+        self.shape = {"v": (n_rows, nz), "d": (n_rows, len(self.edges) - 1), "m": (n_rows, nl, nc),
+                      "t": (n_rows, nl, self.n_t), "s": (12, nz), "ms": (4, nc)}
+        self.keys = {"v": POINT_KEYS, "d": POINT_KEYS, "m": MAP_KEYS, "t": TIME_KEYS, "s": SEASON_KEYS, "ms": SEASON_KEYS}
+        if self.si is None:
+            del self.shape["d"]
+
+        def zeros(*shape):
+            return torch.zeros(*shape, dtype=torch.float64, device=device)
+
+        self.sums = {view: {k: zeros(nv, int(np.prod(shape))) for k in self.keys[view]} for view, shape in self.shape.items()}
+        self.count = {view: zeros(int(np.prod(shape))) for view, shape in self.shape.items()}
+        self.rank = zeros(nv, n_rows * (self.n_members + 1))  # rank of the truth among the members
+        self.coh_levels, self.coh_pairs = zeros(n_rows, 2, nv), zeros(n_rows, 2, nv * (nv - 1) // 2)
+        self.oxy = OxyclineAccumulator(n_rows, device, cfg.oxycline_o2_threshold)
+        self.map_oxy = {k: zeros(n_rows, nc) for k in ("crps", "abs_err", "covered", "count")}
+        self.gen = torch.Generator(device=device)  # ties of the rank histogram, shuffling of the coherence score
+        self.gen.manual_seed(int(cfg.seed))
 
     @torch.no_grad()
     def update(self, row, pred, aux, x, idx, mask, observed, valid_len, x_raw, lat, lon, month):
         """pred O2 members (B, M, T), aux (B, M, T, A) or None, x the model's (drift-shifted) standardised input,
         x_raw the same without drift removal. Returns O2 truth (B, Z) and members (B, M, T) in mmol m-3."""
-        sig_prof = None
-        layer = torch.zeros_like(idx)
+        nz, nc, nl = self.depth.numel(), self.ny * self.nx, len(self.layer_edges) + 1
+        sig_prof, layer = None, torch.zeros_like(idx)
+        iy = torch.floor((lat.double() - self.lat0) / self.res_lat).long().clamp(0, self.ny - 1)
+        ix = torch.floor((lon.double() - self.lon0) / self.res_lon).long().clamp(0, self.nx - 1)
+        cell = (iy * self.nx + ix)[:, None]
+        t = (month.long() - self.month0).clamp(0, self.n_t - 1)[:, None]
+        cal = (month.long() % 12)[:, None]  # 0 = January
+        bins = {}
         if self.si is not None:
             sig_prof = x_raw[..., self.si].float() * self.sig_std + self.sig_mean
             sig_t = sig_prof.gather(1, idx)
-            dbin = torch.bucketize(sig_t, self._inner, right=True)
             layer = torch.bucketize(sig_t, self._layers, right=True)
-        m = mask.reshape(-1)
-        nc = self.ny * self.nx
-        iy = torch.floor((lat.double() - self.lat0) / self.res_lat).long().clamp(0, self.ny - 1)
-        ix = torch.floor((lon.double() - self.lon0) / self.res_lon).long().clamp(0, self.nx - 1)
-        cell = iy * self.nx + ix
-        cflat = (layer * nc + cell[:, None]).reshape(-1)[m]
-        t = (month.long() - self.month0).clamp(0, self.n_t - 1)
-        tflat = (layer * self.n_t + t[:, None]).reshape(-1)[m]
-        self.map_count[row].index_add_(0, cflat, torch.ones_like(cflat, dtype=torch.float64))
-        self.time_count[row].index_add_(0, tflat, torch.ones_like(tflat, dtype=torch.float64))
+            bins["d"] = row * self.shape["d"][1] + torch.bucketize(sig_t, self._inner, right=True)
+        bins.update(v=row * nz + idx, m=(row * nl + layer) * nc + cell, t=(row * nl + layer) * self.n_t + t,
+                    s=cal * nz + idx, ms=((cal + 1) % 12 // 3) * nc + cell)
+        scored = mask.reshape(-1)
+        bins = {view: b.expand_as(idx).reshape(-1)[scored] for view, b in bins.items()}  # bin of every scored point
+        for view, b in bins.items():
+            self.count[view].index_add_(0, b, torch.ones_like(b, dtype=torch.float64))
         for v, f in enumerate(self.feat):
             y = torch.gather(x[..., f], 1, idx).float()
-            pm = point_metrics((pred if v == 0 else aux[..., v - 1]).float(), y, self.tol)
-            self.depth_acc[v].update(row, idx, mask, pm)
-            if sig_prof is not None:
-                self.dens_acc[v].update(row, dbin, mask, pm)
-            for k in MAP_KEYS:
-                self.maps[k][v, row].index_add_(0, cflat, pm[k].reshape(-1)[m].double())
-            for k in TIME_KEYS:
-                self.times[k][v, row].index_add_(0, tflat, pm[k].reshape(-1)[m].double())
+            members = (pred if v == 0 else aux[..., v - 1]).float()
+            pm = {k: val.reshape(-1)[scored].double() for k, val in point_metrics(members, y, self.tol).items()}
+            for view, b in bins.items():
+                for k in self.keys[view]:
+                    self.sums[view][k][v].index_add_(0, b, pm[k])
+            if self.n_members > 1:
+                rank = truth_rank(members, y, self.tol, self.gen).reshape(-1)[scored]
+                self.rank[v].index_add_(0, row * (self.n_members + 1) + rank, torch.ones_like(rank, dtype=torch.float64))
+        if self.n_members > 1:
+            every = pred.float().unsqueeze(-1) if aux is None else torch.cat([pred.float().unsqueeze(-1), aux.float()], dim=-1)
+            feat = torch.as_tensor(self.feat, device=idx.device)
+            truth_all = torch.gather(x.index_select(-1, feat), 1, idx[..., None].expand(-1, -1, len(self.feat))).float()
+            levels, pairs = coherence_sums(every, truth_all, idx, mask, self.gen)
+            self.coh_levels[row] += levels
+            self.coh_pairs[row] += pairs
         truth = x[..., self.ti].float() * self.o2_std + self.o2_mean  # O2 is never drift-shifted
         members = pred.float() * self.o2_std + self.o2_mean
         sc = self.oxy.update(row, truth, members, idx, mask, observed, valid_len, self.depth, sig_prof)
         if sc is not None:
             for k, val in (("crps", sc["crps"]), ("abs_err", sc["abs_err"]), ("covered", sc["covered"]),
                            ("count", torch.ones_like(sc["crps"]))):
-                self.map_oxy[k][row].index_add_(0, cell[sc["ok"]], val.double())
+                self.map_oxy[k][row].index_add_(0, cell[sc["ok"], 0], val.double())
         return truth, members
 
     def finish(self) -> Dict[str, np.ndarray]:
-        accs = self.depth_acc + self.dens_acc
-        _all_reduce([t for a in accs for t in a.sums.values()] + list(self.oxy.sums.values())
-                    + list(self.maps.values()) + [self.map_count] + list(self.map_oxy.values())
-                    + list(self.times.values()) + [self.time_count])
+        _all_reduce([t for group in self.sums.values() for t in group.values()] + list(self.count.values())
+                    + [self.rank, self.coh_levels, self.coh_pairs] + list(self.oxy.sums.values())
+                    + list(self.map_oxy.values()))
+        nv, n_rows, grid2d = len(self.names), len(self.rows), (self.ny, self.nx)
+
+        def sums(view):  # {key: (variable, *bins of the view)}
+            return {k: t.cpu().numpy().reshape((nv,) + self.shape[view]) for k, t in self.sums[view].items()}
+
+        def count(view):
+            return self.count[view].cpu().numpy().reshape(self.shape[view])
+
         out = {"rows": np.asarray(self.rows), "row_name": np.asarray(self.row_name),
                "experiment": np.asarray(self.cfg.experiment), "level_depths": self.depth.cpu().numpy().astype(np.float64),
                "variables": np.asarray(self.names), "units": np.asarray([UNITS.get(n, "") for n in self.names]),
                "var_std": self.std, "n_members": np.asarray(self.n_members), "layer_edges": self.layer_edges,
-               "v_loss": np.asarray([float(a.sums["pinball"].sum() / max(a.sums["count"].sum(), 1.0))
-                                     for a in self.depth_acc])}
-        for prefix, group in (("v_", self.depth_acc), ("d_", self.dens_acc)):
-            res = [a.results(s, self.n_members) for a, s in zip(group, self.std)]
-            for k in (res[0] if res else {}):
-                out[prefix + k] = np.stack([r[k] for r in res])
-        if self.dens_acc:
+               "v_loss": sums("v")["pinball"].sum(axis=(1, 2)) / max(count("v").sum(), 1.0)}
+        for view in ("v", "d"):  # scores per row and level / density bin
+            if view in self.shape:
+                out.update({f"{view}_{k}": val for k, val in scores(sums(view), count(view), self.std, self.n_members).items()})
+        if "d" in self.shape:
             out["density_edges"] = self.edges
         o = {k: v.cpu().numpy() for k, v in self.oxy.sums.items()}
         with np.errstate(invalid="ignore", divide="ignore"):
             out.update(oxy_count=o["count"], oxy_crps=o["crps"] / o["count"], oxy_mae=o["abs_err"] / o["count"],
                        oxy_coverage=o["covered"] / o["count"], oxy_crps_sigma=o["crps_sigma"] / o["count"],
                        oxy_mae_sigma=o["abs_err_sigma"] / o["count"], oxy_coverage_sigma=o["covered_sigma"] / o["count"])
-        nl, shape = len(self.layer_edges) + 1, (self.ny, self.nx)
-        for k, v in self.maps.items():
-            out[f"m_{k}"] = v.cpu().numpy().reshape(v.shape[:2] + (nl,) + shape).astype(np.float32)
-        out["m_count"] = self.map_count.cpu().numpy().reshape((-1, nl) + shape).astype(np.float32)
-        for k, v in self.map_oxy.items():
-            out[f"m_oxy_{k}"] = v.cpu().numpy().reshape((-1,) + shape).astype(np.float32)
+        # maps: sums per cell (figures.py pools rows and layers before dividing)
+        for k, val in sums("m").items():
+            out[f"m_{k}"] = val.reshape(val.shape[:3] + grid2d).astype(np.float32)
+        out["m_count"] = count("m").reshape((n_rows, -1) + grid2d).astype(np.float32)
+        for k, val in self.map_oxy.items():
+            out[f"m_oxy_{k}"] = val.cpu().numpy().reshape((n_rows,) + grid2d).astype(np.float32)
+        for k, val in sums("ms").items():
+            out[f"ms_{k}"] = val.reshape((nv, 4) + grid2d).astype(np.float32)
+        out["ms_count"] = count("ms").reshape((4,) + grid2d).astype(np.float32)
         out["map_lat"] = self.lat0 + self.res_lat * (np.arange(self.ny) + 0.5)
         out["map_lon"] = self.lon0 + self.res_lon * (np.arange(self.nx) + 0.5)
-        tc = self.time_count.cpu().numpy().reshape(len(self.rows), nl, self.n_t)
-        keep = np.nonzero(tc.sum(axis=(0, 1)) > 0)[0]
-        out["t_months"], out["t_count"] = (self.month0 + keep).astype(np.int64), tc[..., keep].astype(np.float32)
-        for k, v in self.times.items():
-            out[f"t_{k}"] = v.cpu().numpy().reshape(len(self.names), len(self.rows), nl, self.n_t)[..., keep] \
-                .astype(np.float32)
+        # months of the record that hold data, and the calendar months
+        keep = np.nonzero(count("t").sum(axis=(0, 1)) > 0)[0]
+        out["t_months"], out["t_count"] = (self.month0 + keep).astype(np.int64), count("t")[..., keep].astype(np.float32)
+        for k, val in sums("t").items():
+            out[f"t_{k}"] = val[..., keep].astype(np.float32)
+        out.update({f"s_{k}": val for k, val in sums("s").items()}, s_count=count("s"))
+        # calibration and coherence (ensembles only)
+        out["rank"] = self.rank.cpu().numpy().reshape(nv, n_rows, self.n_members + 1)
+        out["coh_levels"] = self.coh_levels.cpu().numpy()
+        pairs = np.zeros((n_rows, 2, nv, nv))
+        a, b = np.triu_indices(nv, 1)
+        pairs[..., a, b] = pairs[..., b, a] = self.coh_pairs.cpu().numpy()
+        out["coh_variables"] = pairs
         out["objective"] = np.asarray(objective(self.cfg, out))
         return out
 
@@ -386,6 +448,11 @@ def scalars(r: Dict[str, np.ndarray], prefix: str) -> Dict[str, float]:
     if c.sum() > 0:
         for k in ("crps", "mae", "coverage", "crps_sigma", "mae_sigma", "coverage_sigma"):
             out[f"{prefix}/oxycline/{k}"] = float(pooled(r[f"oxy_{k}"], c))
+    if "coh_levels" in r and int(r["n_members"]) > 1:  # see coherence()
+        for name, value in zip(r["variables"], coherence(r["coh_levels"])):
+            out[f"{prefix}/vars/{name}/coherence_levels"] = float(value)
+        if len(r["variables"]) > 1:
+            out[f"{prefix}/coherence_variables"] = float(coherence(r["coh_variables"].sum(axis=(2, 3))[..., None])[0])
     return out
 
 
@@ -396,4 +463,7 @@ def summary_line(r: Dict[str, np.ndarray]) -> str:
             f"coverage {s[o2 + '/coverage']:.3f}, spread/skill {s[o2 + '/spread_skill']:.2f}")
     if "x/oxycline/crps" in s:
         line += f" | oxycline CRPS {s['x/oxycline/crps']:.1f} m, {s['x/oxycline/crps_sigma']:.3f} kg m-3"
+    if o2 + "/coherence_levels" in s:
+        line += f" | O2 coherence between levels {s[o2 + '/coherence_levels']:.2f}"
+        line += f", between variables {s['x/coherence_variables']:.2f}" if "x/coherence_variables" in s else ""
     return line + " | CRPS " + ", ".join(f"{n} {s[f'x/vars/{n}/crps']:.3g}" for n in r["variables"])
