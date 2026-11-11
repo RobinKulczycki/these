@@ -52,11 +52,14 @@ water column: its O2, density, nutrients ... belong together. This holds in the 
 - **Physically**: `figures.py ensemble` writes `ensemble_coherence.csv` (density inversions, and how far a member's
   sigma0 is from the equation of state applied to its own T and S), and draws three members in the same colour in
   every variable panel.
-- **Between profiles** (`neighbours`): scoring draws a separate noise for every profile, so two neighbouring
-  predictions are unrelated draws. `figures.py field` gives every member ONE draw for the whole map instead, which
-  makes a member a coherent field without retraining (the error bars of each profile are unchanged). It prints the
-  correlation between two profiles, next to each other and `neighbour_max_km` apart, for the real error and for the
-  members. If the members are more alike far apart than the real error is, give the noise a length scale with
+- **Between neighbouring predicted columns** (`neighbours`): a member uses the same noise in neighbouring columns,
+  always. In training and in every evaluation a sample is a pair, a profile and a profile next to it, given the
+  same casts and predicted with the same noise; the loss also scores the difference between the two (member m
+  minus member m), so the model learns how a member must change from one column to the next. Each evaluation
+  reports it as "coherence between columns" (same scale as above; the reference is the two columns drawn
+  separately). `figures.py field` maps a whole time step with ONE draw per member for the whole map, and prints
+  the correlation between two profiles, next to each other and `neighbour_max_km` apart, for the real error and for
+  the members. If the members are more alike far apart than the real error is, give the noise a length scale with
   `--noise-km` (noise that varies smoothly over the map) and pick the distance that matches.
 
 ## Neighbours (2-D) experiment
@@ -80,6 +83,9 @@ Rows of every score are the distance to the nearest given cast (`neighbour_val_k
 the same casts (`<metrics file>_idw.npz`), which `figures.py` adds automatically. A sample has up to 5x the tokens
 of a cutoff one: lower `batch_size` if the GPU runs out of memory. Drift: `none` or `lagged` (`shallowest` has no
 meaning here). `neighbour_eval_casts` only changes evaluation; training always draws 1..`neighbour_casts`.
+`batch_size` counts profiles, so a batch holds `batch_size / 2` pairs. The scores (and the IDW baseline) are those
+of the first profile of every pair, the same profiles as without pairs. `neighbour_pair_weight` (1) weights the
+loss on the difference between the two columns; 0 trains without it (the pairs still share their noise).
 
 Drift modes: `none`, `shallowest` (minus the shallowest observed value), `lagged` (minus the basin-mean profile of the
 same month over the archive years [Y - drift_lag_years - drift_window_years + 1, Y - drift_lag_years]).

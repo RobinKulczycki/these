@@ -252,7 +252,8 @@ class Evaluator:
       v   row x model level                        d   row x bin of the true sigma0
       m   row x water-mass layer x map cell        t   row x water-mass layer x month of the record
       s   calendar month x model level             ms  season (DJF, MAM, JJA, SON) x map cell
-    plus the rank histogram, the coherence of the members and the oxycline."""
+    plus the rank histogram, the coherence of the members (between levels, variables and, for "neighbours",
+    neighbouring columns) and the oxycline."""
 
     def __init__(self, cfg, grid: dict, stats, rows: Sequence[float], row_name: str, device):
         self.cfg, self.rows, self.row_name = cfg, list(rows), row_name
@@ -301,6 +302,7 @@ class Evaluator:
         self.count = {view: zeros(int(np.prod(shape))) for view, shape in self.shape.items()}
         self.rank = zeros(nv, n_rows * (self.n_members + 1))  # rank of the truth among the members
         self.coh_levels, self.coh_pairs = zeros(n_rows, 2, nv), zeros(n_rows, 2, nv * (nv - 1) // 2)
+        self.coh_columns = zeros(n_rows, 2, nv)  # "neighbours": between two neighbouring predicted profiles
         self.oxy = OxyclineAccumulator(n_rows, device, cfg.oxycline_o2_threshold)
         self.map_oxy = {k: zeros(n_rows, nc) for k in ("crps", "abs_err", "covered", "count")}
         self.gen = torch.Generator(device=device)  # ties of the rank histogram, shuffling of the coherence score
@@ -355,9 +357,22 @@ class Evaluator:
                 self.map_oxy[k][row].index_add_(0, cell[sc["ok"], 0], val.double())
         return truth, members
 
+    @torch.no_grad()
+    def update_columns(self, row, pred, aux, x, idx, mask) -> None:
+        """Coherence between neighbouring columns, as coherence_sums: rows 2i and 2i + 1 are a profile and its
+        neighbour, predicted with the same noise. Scored: the difference between the two, member m minus member m
+        (as predicted) and member m minus member m + 1 (what two separate draws would give)."""
+        every = pred.unsqueeze(-1) if aux is None else torch.cat([pred.unsqueeze(-1), aux], dim=-1)  # (2B, M, T, V)
+        feat = torch.as_tensor(self.feat, device=idx.device)
+        truth = torch.gather(x.index_select(-1, feat), 1, idx[..., None].expand(-1, -1, len(self.feat))).float()
+        both = (mask[0::2] & mask[1::2])[..., None]
+        for i, other in enumerate((every[1::2], every[1::2].roll(1, dims=1))):
+            crps = crps_ensemble(every[0::2] - other, truth[0::2] - truth[1::2])
+            self.coh_columns[row, i] += (crps * both).sum(dim=(0, 1)).double()
+
     def finish(self) -> Dict[str, np.ndarray]:
         _all_reduce([t for group in self.sums.values() for t in group.values()] + list(self.count.values())
-                    + [self.rank, self.coh_levels, self.coh_pairs] + list(self.oxy.sums.values())
+                    + [self.rank, self.coh_levels, self.coh_pairs, self.coh_columns] + list(self.oxy.sums.values())
                     + list(self.map_oxy.values()))
         nv, n_rows, grid2d = len(self.names), len(self.rows), (self.ny, self.nx)
 
@@ -406,6 +421,8 @@ class Evaluator:
         a, b = np.triu_indices(nv, 1)
         pairs[..., a, b] = pairs[..., b, a] = self.coh_pairs.cpu().numpy()
         out["coh_variables"] = pairs
+        if bool((self.coh_columns != 0).any()):
+            out["coh_columns"] = self.coh_columns.cpu().numpy()
         out["objective"] = np.asarray(objective(self.cfg, out))
         return out
 
@@ -451,6 +468,8 @@ def scalars(r: Dict[str, np.ndarray], prefix: str) -> Dict[str, float]:
     if "coh_levels" in r and int(r["n_members"]) > 1:  # see coherence()
         for name, value in zip(r["variables"], coherence(r["coh_levels"])):
             out[f"{prefix}/vars/{name}/coherence_levels"] = float(value)
+        for name, value in zip(r["variables"], coherence(r["coh_columns"]) if "coh_columns" in r else []):
+            out[f"{prefix}/vars/{name}/coherence_columns"] = float(value)
         if len(r["variables"]) > 1:
             out[f"{prefix}/coherence_variables"] = float(coherence(r["coh_variables"].sum(axis=(2, 3))[..., None])[0])
     return out
@@ -466,4 +485,5 @@ def summary_line(r: Dict[str, np.ndarray]) -> str:
     if o2 + "/coherence_levels" in s:
         line += f" | O2 coherence between levels {s[o2 + '/coherence_levels']:.2f}"
         line += f", between variables {s['x/coherence_variables']:.2f}" if "x/coherence_variables" in s else ""
+        line += f", between columns {s[o2 + '/coherence_columns']:.2f}" if o2 + "/coherence_columns" in s else ""
     return line + " | CRPS " + ", ".join(f"{n} {s[f'x/vars/{n}/crps']:.3g}" for n in r["variables"])

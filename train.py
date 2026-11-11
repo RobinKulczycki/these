@@ -73,6 +73,8 @@ def autocast(cfg: Config, device):
 
 
 def make_loader(ds, cfg: Config, batch_size: int, train: bool, ddp: bool):
+    if cfg.experiment == "neighbours":  # a sample is a pair of profiles: batch_size still counts profiles
+        batch_size = max(1, batch_size // 2)
     sampler = DistributedSampler(ds, shuffle=train, drop_last=train, seed=cfg.seed) if ddp else None
     return DataLoader(ds, batch_size=batch_size, shuffle=train and sampler is None, sampler=sampler,
                       num_workers=cfg.num_workers, pin_memory=torch.cuda.is_available(), drop_last=train,
@@ -165,6 +167,8 @@ def check_config(cfg: Config, depth) -> None:
             raise ValueError("neighbour_casts must be >= 1 and neighbour_eval_casts in [1, neighbour_casts]")
         if max(cfg.neighbour_val_km) < cfg.neighbour_max_km:
             raise ValueError("the last neighbour_val_km bin must reach neighbour_max_km")
+        if cfg.neighbour_pair_weight < 0:
+            raise ValueError("neighbour_pair_weight must be >= 0")
 
 
 # --------------------------------------------------------------------------------------- what the model is given
@@ -207,6 +211,8 @@ class Task:
 
     def __init__(self, cfg: Config, grid: dict, stats, device):
         self.cfg = cfg
+        # "neighbours": rows 2i and 2i + 1 of a batch are a profile and its neighbour, predicted with the same noise
+        self.paired = cfg.experiment == "neighbours"
         self.ti = int(grid["target_index"])
         aux_names, aux_feat = aux_feature_indices(cfg, grid)
         self.names = [grid["target"]] + aux_names  # every predicted variable, O2 first
@@ -220,6 +226,10 @@ class Task:
         self.k_lim = (max(1, cfg.min_input_levels), max_input_levels(grid["depth"], cfg.max_input_depth_m))
         self.spacings = torch.as_tensor([float(s) for s in cfg.sparse_train_spacings_m], device=device)
         self.km_edges = torch.as_tensor(sorted(float(v) for v in cfg.neighbour_val_km), device=device)
+
+    def batch(self, batch: dict, device) -> dict:
+        """A batch of the loader on the device; pairs (B, 2, ...) become consecutive rows (2B, ...)."""
+        return {k: (v.flatten(0, 1) if self.paired else v).to(device, non_blocking=True) for k, v in batch.items()}
 
     def inputs(self, net, b: dict, key=None):
         """Batch b -> (inputs of the model, x holding the targets, observed levels (B, Z), profiles that are given
@@ -247,7 +257,8 @@ class Task:
         if self.cfg.experiment == "sparse":
             return torch.ones_like(b["valid_len"], dtype=torch.bool)
         km = b["src_dxy"].float().norm(dim=-1).masked_fill(b["src_len"] == 0, float("inf")).amin(dim=1)
-        return torch.bucketize(km, self.km_edges) == i  # distance bin of the nearest cast (no cast: no row)
+        row = torch.bucketize(km, self.km_edges)[0::2]  # distance bin of the nearest cast (no cast: no row)
+        return (row == i).repeat_interleave(2)  # a pair stays together: its row is that of its first profile
 
     def losses(self, pred, aux, x, target_idx, mask):
         """Half the (almost-)fair CRPS over the real targets: O2 () and every other variable (A,) or None."""
@@ -260,11 +271,29 @@ class Task:
         per_feature = 0.5 * crps_ensemble(aux.float(), gather_levels(x, target_idx, self.aux_idx).float(), alpha, dim=1)
         return loss_o2, (per_feature * mask.unsqueeze(-1)).sum(dim=(0, 1)) / n_real
 
+    def pair_loss(self, pred, aux, x, target_idx, mask):
+        """"neighbours": the same loss for the difference between the two profiles of every pair (member m of one
+        minus member m of the other, which share their noise) -> scalar, the variables weighted as in the loss."""
+        every = pred.unsqueeze(-1) if aux is None else torch.cat([pred.unsqueeze(-1), aux], dim=-1)  # (2B, M, T, V)
+        truth = gather_levels(x, target_idx, self.feat)
+        both = (mask[0::2] * mask[1::2]).unsqueeze(-1)  # levels predicted in the two profiles
+        crps = crps_ensemble((every[0::2] - every[1::2]).float(), (truth[0::2] - truth[1::2]).float(),
+                             self.cfg.fgn_crps_alpha, dim=1)
+        per_feature = (0.5 * crps * both).sum(dim=(0, 1)) / both.sum().clamp(min=1.0)
+        return combine_losses(self.cfg, per_feature[0], per_feature[1:] if aux is not None else None, self.loss_w)
 
-def fgn_members(net, inputs: tuple, n_members: int, chunk: int = 0, generator=None, noise=None):
+
+def pair_noise(n_profiles: int, n_members: int, dim: int, device, generator=None) -> torch.Tensor:
+    """One noise draw per member and PAIR of profiles (rows 2i and 2i + 1 get the same) -> (n_profiles, M, dim)."""
+    z = torch.randn(n_profiles // 2, n_members, dim, generator=generator, device=device)
+    return z.repeat_interleave(2, dim=0)
+
+
+def fgn_members(net, inputs: tuple, n_members: int, chunk: int = 0, generator=None, noise=None, paired=False):
     """All members of one batch, drawn `chunk` at a time: O2 (B, M, T), idx, mask, other variables (B, M, T, A) or
-    None. Every profile draws its own noise, unless it is given: noise (M, noise_dim) = member m uses the same draw
-    in every profile, which makes it one coherent field (figures.py field); or (B, M, noise_dim), one per profile."""
+    None. Every profile draws its own noise, unless paired (pair_noise) or the noise is given: (M, noise_dim) =
+    member m uses the same draw in every profile, which makes it one coherent field (figures.py field); or
+    (B, M, noise_dim), one per profile."""
     bsz = inputs[0].shape[0]
     casts = inputs[0].shape[1] + 1 if inputs[0].dim() == 4 else 1  # "neighbours": about (K + 1) x longer sequences
     step = max(1, min(n_members, FGN_MAX_SEQUENCES // max(bsz * casts, 1))) if chunk <= 0 else min(chunk, n_members)
@@ -273,6 +302,8 @@ def fgn_members(net, inputs: tuple, n_members: int, chunk: int = 0, generator=No
         m = min(step, n_members - start)
         if noise is not None:
             z = (noise[None] if noise.dim() == 2 else noise)[:, start:start + m].expand(bsz, -1, -1)
+        elif paired:
+            z = pair_noise(bsz, m, net.noise_dim, inputs[0].device, generator)
         elif generator is not None:
             z = torch.randn(bsz, m, net.noise_dim, generator=generator, device=generator.device)
         else:
@@ -306,13 +337,16 @@ def train_one_epoch(model, loader, opt, sched, scaler, cfg: Config, task: Task, 
     for it, batch in enumerate(loader):
         if it >= n_batches:
             break
-        b = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+        b = task.batch(batch, device)
         inputs, x, _, given = task.inputs(net, b)
+        noise = {"noise": pair_noise(len(x), cfg.fgn_train_members, net.noise_dim, device)} if task.paired else {}
         with autocast(cfg, device):
-            pred, target_idx, target_mask, aux = model(*inputs, n_members=cfg.fgn_train_members)
+            pred, target_idx, target_mask, aux = model(*inputs, n_members=cfg.fgn_train_members, **noise)
         mask = (target_mask & given[:, None]).float()
         loss_o2, loss_aux = task.losses(pred, aux, x, target_idx, mask)
         loss = combine_losses(cfg, loss_o2, loss_aux, task.loss_w)
+        if task.paired and cfg.neighbour_pair_weight > 0:
+            loss = loss + cfg.neighbour_pair_weight * task.pair_loss(pred, aux, x, target_idx, mask)
         scaler.scale(loss).backward()
         scaler.unscale_(opt)
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
@@ -362,7 +396,7 @@ def evaluate(model, loader, cfg: Config, grid: dict, stats, task: Task, device) 
     example_row = len(keys) // 2 if cfg.experiment != "cutoff" else int(np.argmin([abs(r - 50.0) for r in rows]))
     examples = None
     for batch in loader:
-        b = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+        b = task.batch(batch, device)
         for i, key in enumerate(keys):
             sel = task.scored(b, i, key)
             if not bool(sel.any()):
@@ -370,10 +404,15 @@ def evaluate(model, loader, cfg: Config, grid: dict, stats, task: Task, device) 
             sub = {k: v[sel] for k, v in b.items()}
             inputs, x, obs, given = task.inputs(net, sub, key)
             with autocast(cfg, device):
-                pred, idx, mask, aux = fgn_members(net, inputs, cfg.fgn_eval_members, cfg.fgn_member_chunk, gen)
-            mask = mask & given[:, None]
+                pred, idx, mask, aux = fgn_members(net, inputs, cfg.fgn_eval_members, cfg.fgn_member_chunk, gen,
+                                                   paired=task.paired)
+            pred, aux, mask = pred.float(), None if aux is None else aux.float(), mask & given[:, None]
+            if task.paired:  # the pair gives the coherence between columns; its first profile gives every other score
+                ev.update_columns(i, pred, aux, x, idx, mask)
+                pred, aux, x, idx, mask, obs = (None if t is None else t[0::2] for t in (pred, aux, x, idx, mask, obs))
+                sub = {k: v[0::2] for k, v in sub.items()}
             where = (x, idx, mask, obs, sub["valid_len"], sub["x_raw"], sub["lat"], sub["lon"], sub["month"])
-            truth, members = ev.update(i, pred.float(), None if aux is None else aux.float(), *where)
+            truth, members = ev.update(i, pred, aux, *where)
             if ev_idw is not None:
                 base = idw_baseline(sub["src_x"], sub["src_len"], sub["src_dxy"], idx, task.feat)
                 ev_idw.update(i, base[..., 0], base[..., 1:] if aux is not None else None, *where)

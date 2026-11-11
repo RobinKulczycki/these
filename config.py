@@ -84,6 +84,9 @@ class Config:
     neighbour_casts: int = 4
     neighbour_max_km: float = 50.0
     neighbour_eval_casts: Optional[int] = None  # evaluation: exactly this many casts (None: as in training)
+    # A sample is a pair of neighbouring profiles predicted with the same noise; the loss also scores their
+    # difference (x this weight), which is what keeps a member coherent from one column to the next. 0 = off.
+    neighbour_pair_weight: float = 1.0
     neighbour_val_km: Tuple[float, ...] = (10, 20, 30, 40, 50)  # rows: distance of the nearest cast, bin upper edges
 
     # ---- model (FGN: every LayerNorm modulated by a noise vector shared by the whole profile)

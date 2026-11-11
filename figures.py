@@ -473,24 +473,31 @@ def fig_rank(runs: Runs):
 
 def fig_coherence(runs: Runs):
     """Coherence of the members (metrics.coherence_sums): how much better they predict the difference between two
-    consecutive levels (left) and between two variables (right, first run) than the same members shuffled.
+    consecutive levels, between two neighbouring predicted columns ("neighbours" only) and between two variables
+    (right, first run) than the same members shuffled.
     0 = no better than independent draws, 1 = perfect, below 0 = wrong coherence."""
     runs = [(label, m) for label, m in runs if "coh_levels" in m and is_ensemble(m)]
     m0 = runs[0][1]
     nv = len(names(m0))
-    fig, (ax, ax2) = plt.subplots(1, 2, figsize=(13.5, 5.2), gridspec_kw={"width_ratios": [1.25, 1]})
+    bars = [("coh_levels", "Between consecutive levels")]
+    bars += [("coh_columns", "Between neighbouring columns")] if "coh_columns" in m0 else []
+    fig, axes = plt.subplots(1, len(bars) + 1, figsize=(6.6 * len(bars) + 6.6, 5.2), squeeze=False)
     width = 0.8 / len(runs)
-    for i, ((label, m), color) in enumerate(zip(runs, SERIES)):
-        val = coherence(m["coh_levels"])
-        xs = [names(m0).index(n) + (i - (len(runs) - 1) / 2) * width for n in names(m) if n in names(m0)]
-        ax.bar(xs, [val[names(m).index(n)] for n in names(m) if n in names(m0)], width * 0.92, color=color, label=label)
-    ax.axhline(0, color=INK2, lw=0.8)
-    ax.set_xticks(np.arange(nv))
-    ax.set_xticklabels([SHORT_NAMES.get(n, n) for n in names(m0)])
-    ax.set_ylim(min(0.0, ax.get_ylim()[0]), 1.0)
-    ax.set(ylabel="coherence (1 - CRPS as predicted / CRPS shuffled)", title="Between consecutive levels")
-    if len(runs) > 1:
-        ax.legend(fontsize=9)
+    for ax, (key, title) in zip(axes[0], bars):
+        for i, ((label, m), color) in enumerate(zip(runs, SERIES)):
+            if key in m:
+                val = coherence(m[key])
+                shown = [n for n in names(m) if n in names(m0)]
+                xs = [names(m0).index(n) + (i - (len(runs) - 1) / 2) * width for n in shown]
+                ax.bar(xs, [val[names(m).index(n)] for n in shown], width * 0.92, color=color, label=label)
+        ax.axhline(0, color=INK2, lw=0.8)
+        ax.set_xticks(np.arange(nv))
+        ax.set_xticklabels([SHORT_NAMES.get(n, n) for n in names(m0)])
+        ax.set_ylim(min(0.0, ax.get_ylim()[0]), 1.0)
+        ax.set(ylabel="coherence (1 - CRPS as predicted / CRPS shuffled)", title=title)
+        if len(runs) > 1:
+            ax.legend(fontsize=9)
+    ax2 = axes[0, -1]
     mat = coherence(m0["coh_variables"]) if nv > 1 else np.full((1, 1), np.nan)
     ax2.set_facecolor(NODATA)
     mesh = ax2.pcolormesh(np.arange(nv + 1) - 0.5, np.arange(nv + 1) - 0.5, np.ma.masked_invalid(mat), cmap=DIV.reversed(),
@@ -524,6 +531,7 @@ def summary_rows(label: str, m) -> List[list]:
         row.append(row[3] / float(m["var_std"][v]))
         row.append(float(np.sqrt(pooled(m["v_spread"][v] ** 2, w) / pooled(m["v_rmse_ensmean"][v] ** 2, w))))
         row.append(float(coherence(m["coh_levels"])[v]) if "coh_levels" in m else float("nan"))
+        row.append(float(coherence(m["coh_columns"])[v]) if "coh_columns" in m else float("nan"))
         if not is_ensemble(m):  # a single estimate has no coverage, spread or coherence
             row[6], row[8], row[9] = float("nan"), float("nan"), float("nan")
         if "density_edges" in m and len(labs) > 1:
@@ -565,7 +573,7 @@ def cmd_compare(runs: Runs, out: Path, max_depth: float = 300.0) -> None:
     with open(out / "summary.csv", "w", newline="") as fh:
         wr = csv.writer(fh)
         wr.writerow(["run", "variable", "unit", "CRPS", "MAE", "bias", "coverage", "CRPS/std", "spread/skill",
-                     "coherence between levels"] + [f"CRPS sigma0 {lab}" for lab in labs])
+                     "coherence between levels", "coherence between columns"] + [f"CRPS sigma0 {lab}" for lab in labs])
         for label, m in runs:
             wr.writerows([r[:3] + [f"{x:.4g}" for x in r[3:]] for r in summary_rows(label, m)])
     print((out / "summary.csv").read_text())
@@ -925,7 +933,7 @@ def cmd_ensemble(run: str, processed_dir: Optional[str], out: Path, row: Optiona
         row = row if row is not None else (20.0 if cfg.experiment == "sparse" else 50.0)
         key = float(row) if cfg.experiment == "sparse" else cutoff_levels(depth, [row], 1)[0][0]
     ds = make_dataset(cfg, grid, stats, resolve_splits(cfg, load_grid(cfg)["years"])[split], False, max_profiles=2000,
-                      seed=12345, in_memory=False, extras=True)
+                      seed=12345, in_memory=False, extras=True, **({"pairs": False} if nb else {}))
     b = torch.utils.data.default_collate([ds[i] for i in range(len(ds))])
     keep = (b["valid_len"] > int(np.searchsorted(depth, max_depth))) & ((b["src_len"] > 0).any(dim=1) if nb else True)
     deep = {k: v[keep].to(device) for k, v in b.items()}  # profiles that reach max_depth
@@ -1027,7 +1035,7 @@ def cmd_field(run: str, processed_dir: Optional[str], out: Path, split: str = "v
     if cfg.experiment != "neighbours":
         raise SystemExit("figures.py field needs a run of experiment=neighbours")
     year = resolve_splits(cfg, load_grid(cfg)["years"])[split][0]
-    ds = NeighbourDataset(cfg, grid, stats, [year], train=False, in_memory=False, extras=True)
+    ds = NeighbourDataset(cfg, grid, stats, [year], train=False, in_memory=False, extras=True, pairs=False)
     b, st_lat, st_lon = ds.field(0, step, station_km)
     b = {k: v.to(device) for k, v in b.items()}
     lat_ax, lon_ax = np.asarray(grid["lat"]), np.asarray(grid["lon"])

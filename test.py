@@ -43,7 +43,8 @@ def check(cond, what: str) -> None:
 
 
 def synthetic_data(out: Path, years=range(2000, 2008)) -> None:
-    """Black-Sea-like profiles: isopycnals dome in two gyres, O2 / NO3 / PO4 follow sigma0, the upper layer drifts."""
+    """Black-Sea-like profiles: isopycnals dome in two gyres, O2 / NO3 / PO4 follow sigma0, the upper layer drifts.
+    What differs from one profile to the next varies slowly over the sea, so that neighbours resemble each other."""
     rng = np.random.default_rng(0)
     depth = np.array([2.5, 5, 7.5, 10, 15, 20, 25, 30, 40, 50, 60, 70, 80, 90, 100, 115, 130, 150, 175, 200, 250, 300,
                       400, 500])
@@ -53,15 +54,22 @@ def synthetic_data(out: Path, years=range(2000, 2008)) -> None:
     bottom = np.where(ell < 0.55, 2000.0, np.clip(2000 * (1 - ell) / 0.45, 20, 2000))
     gyre = sum(np.exp(-(((LO - x) / 1.6) ** 2 + ((LA - 43.2) / 0.9) ** 2)) for x in (31.5, 37.5))
     feats = ["o2", "thetao", "so", "sigma0", "chl", "no3", "po4", "dissic", "ph"]
+
+    def smooth():  # a random map (std ~1) made of a few long waves, plus a little noise per profile
+        waves = sum(rng.standard_normal() * np.sin(kx * LO + ky * LA + phase)
+                    for kx, ky, phase in rng.uniform([-1.5, -3.0, 0.0], [1.5, 3.0, 6.3], (4, 3)))
+        return 0.65 * waves + 0.3 * rng.standard_normal(LO.shape)
+
     for year in years:
         rows = []
         for month in range(12):
             summer = max(np.cos(2 * np.pi * (month - 7) / 12), 0)
+            dome, oxycline = smooth(), smooth()
             for iy, ix in np.argwhere(ell < 1.0):
-                g = gyre[iy, ix] + 0.15 * rng.standard_normal()
+                g = gyre[iy, ix] + 0.15 * dome[iy, ix]
                 sig = 17.0 - 5.2 * np.exp(-depth * (1 + 0.6 * g) / 70) - 1.5 * summer * np.exp(-depth / 15)
                 sig = sig + 0.03 * rng.standard_normal(len(depth))
-                o2 = 280 * np.clip((15.7 + 0.08 * rng.standard_normal() - sig) / 1.6, 0, 1) ** 1.3
+                o2 = 280 * np.clip((15.7 + 0.08 * oxycline[iy, ix] - sig) / 1.6, 0, 1) ** 1.3
                 drift = (year - years[0]) * np.exp(-depth / 80)
                 arr = np.stack([o2, 8.9 + 15 * summer * np.exp(-depth / 12) + 0.05 * drift,
                                 18 + 0.85 * (sig - 11) + 0.04 * drift, sig,
@@ -162,6 +170,8 @@ def synthetic(tmp: Path) -> None:
     check(str(r["experiment"]) == "neighbours" and (r["v_count"][0].sum(axis=1) > 0).all(), "scores per distance row")
     check(np.array_equal(r["v_count"], idw["v_count"]) and int(idw["n_members"]) == 1,
           "IDW baseline scored on the same points")
+    check(np.isfinite(r["coh_columns"]).all() and (r["coh_columns"][:, 1] > 0).all() and "coh_columns" not in idw,
+          "coherence between neighbouring columns scored (pairs sharing their noise)")
     check(same_metrics(evaluate("nb"), r) < 1e-5 and same_metrics(metrics(runs / "nb" / "val_metrics_idw.npz"), idw) < 1e-5,
           "neighbours --eval-only reproduces (same casts drawn)")
     run("train.py", "--eval-only", "--split", "val", "--max-profiles", 200, "--tag", "1cast", "--set", f"processed_dir={data}",
@@ -174,8 +184,12 @@ def synthetic(tmp: Path) -> None:
     cfg = apply_overrides(Config(), [f"processed_dir={data}", "neighbour_max_km=100", "neighbour_eval_casts=1"])
     ds = [NeighbourDataset(cfg, load_grid(cfg), load_or_compute_stats(cfg, load_grid(cfg), [2000, 2001, 2002, 2003, 2004]),
                            [2005], train=train, in_memory=False) for train in (True, False)]
-    casts = [[int((d[i]["src_len"] > 0).sum()) for i in range(0, 400, 7)] for d in ds]
+    casts = [[int((d[i]["src_len"][0] > 0).sum()) for i in range(0, 400, 7)] for d in ds]
     check(max(casts[0]) > 1 and max(casts[1]) == 1, "neighbour_eval_casts applies to evaluation only")
+    pair = ds[1][5]  # a profile and its neighbour: next to each other, given the same casts
+    km = float((pair["src_dxy"][0, 0] - pair["src_dxy"][1, 0]).norm())
+    check(pair["x"].shape[0] == 2 and torch.equal(pair["src_x"][0], pair["src_x"][1]) and 0 < km < 70,
+          f"a sample is a pair of neighbouring profiles ({km:.0f} km apart)")
     train("nb_bad", *nb, "input_drift_mode=shallowest", epochs=1, ok=False)
     check(True, "neighbours + shallowest drift is refused")
 
