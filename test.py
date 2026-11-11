@@ -44,7 +44,8 @@ def check(cond, what: str) -> None:
 
 def synthetic_data(out: Path, years=range(2000, 2008)) -> None:
     """Black-Sea-like profiles: isopycnals dome in two gyres, O2 / NO3 / PO4 follow sigma0, the upper layer drifts.
-    What differs from one profile to the next varies slowly over the sea, so that neighbours resemble each other."""
+    As in the reanalysis, what differs from one profile to the next varies slowly over the sea and with depth, so
+    that neighbouring profiles (and levels) resemble each other."""
     rng = np.random.default_rng(0)
     depth = np.array([2.5, 5, 7.5, 10, 15, 20, 25, 30, 40, 50, 60, 70, 80, 90, 100, 115, 130, 150, 175, 200, 250, 300,
                       400, 500])
@@ -58,17 +59,17 @@ def synthetic_data(out: Path, years=range(2000, 2008)) -> None:
     def smooth():  # a random map (std ~1) made of a few long waves, plus a little noise per profile
         waves = sum(rng.standard_normal() * np.sin(kx * LO + ky * LA + phase)
                     for kx, ky, phase in rng.uniform([-1.5, -3.0, 0.0], [1.5, 3.0, 6.3], (4, 3)))
-        return 0.65 * waves + 0.3 * rng.standard_normal(LO.shape)
+        return 0.65 * waves + 0.1 * rng.standard_normal(LO.shape)
 
     for year in years:
         rows = []
         for month in range(12):
             summer = max(np.cos(2 * np.pi * (month - 7) / 12), 0)
-            dome, oxycline = smooth(), smooth()
+            dome, oxycline, wiggle1, wiggle2 = smooth(), smooth(), smooth(), smooth()
             for iy, ix in np.argwhere(ell < 1.0):
                 g = gyre[iy, ix] + 0.15 * dome[iy, ix]
                 sig = 17.0 - 5.2 * np.exp(-depth * (1 + 0.6 * g) / 70) - 1.5 * summer * np.exp(-depth / 15)
-                sig = sig + 0.03 * rng.standard_normal(len(depth))
+                sig = sig + 0.03 * (wiggle1[iy, ix] * np.sin(depth / 30.0) + wiggle2[iy, ix] * np.cos(depth / 70.0))
                 o2 = 280 * np.clip((15.7 + 0.08 * oxycline[iy, ix] - sig) / 1.6, 0, 1) ** 1.3
                 drift = (year - years[0]) * np.exp(-depth / 80)
                 arr = np.stack([o2, 8.9 + 15 * summer * np.exp(-depth / 12) + 0.05 * drift,
