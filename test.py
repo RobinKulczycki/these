@@ -234,6 +234,10 @@ def synthetic(tmp: Path) -> None:
     c = [float(x) for x in re.findall(r"-?\d+\.\d\d", line.split("):")[1])]
     check(c[1] > 0.5 > abs(c[2]), f"field: members sharing their noise are coherent between profiles ({c[1]:.2f}), "
                                   f"members with their own noise are not ({c[2]:.2f})")
+    run("figures.py", "layouts", runs / "nb", "--every", 2, 3, "--steps", 0, 6, "--out", figs / "nb_layouts")
+    table = (figs / "nb_layouts" / "layouts.csv").read_text().splitlines()
+    check(len(table) == 5 and table[1].split(",")[2] == table[2].split(",")[2],
+          "layouts: grid and Argo-like stations, the same number of each")
     old = {k: v for k, v in metrics(runs / "cut" / "val_metrics.npz").items() if k.split("_")[0] not in ("s", "ms", "rank", "coh")}
     np.savez(runs / "cut_old_metrics.npz", **old)
     run("figures.py", "compare", runs / "cut_old_metrics.npz", "--out", figs / "old_file")
@@ -242,7 +246,8 @@ def synthetic(tmp: Path) -> None:
         "--set", "train_years=(2000,2001,2002,2003,2004)", "val_years=(2005,)", "test_years=(2006,2007)")
     n = {d.name: len(list(d.rglob("*.png"))) for d in figs.iterdir()}
     check(n["cut"] >= 73 and n["sparse"] >= 69 and n["test_maps"] >= 31 and n["drift"] == 2 and n["nb"] >= 71
-          and n["nb_casts"] >= 36 and n["nb_field"] == 2 and n["old_file"] >= 50, f"figures written {n}")
+          and n["nb_casts"] >= 36 and n["nb_field"] == 2 and n["nb_layouts"] == 3 and n["old_file"] >= 50,
+          f"figures written {n}")
     import figures
 
     figs_wandb = figures.wandb_figures(metrics(runs / "cut" / "val_metrics.npz"), True, None)

@@ -285,6 +285,7 @@ class NeighbourDataset(ProfileDataset):
         super().__init__(cfg, grid, stats, years, max_profiles, seed, in_memory, extras)
         self.train, self.seed, self.pairs = train, int(seed), pairs
         self.k_max, self.max_km = int(cfg.neighbour_casts), float(cfg.neighbour_max_km)
+        self.depth = np.asarray(grid["depth"], dtype=np.float64)
         self.k_eval = None if train else cfg.neighbour_eval_casts  # evaluation only: exactly this many casts
         lat_ax, lon_ax = np.asarray(grid["lat"], dtype=np.float64), np.asarray(grid["lon"], dtype=np.float64)
         step = lambda a: float(np.median(np.diff(a))) if a.size > 1 else 1.0  # noqa: E731
@@ -349,26 +350,46 @@ class NeighbourDataset(ProfileDataset):
         other = self.sample(f, p, cand[pick], *self.km_from(f, p, cand[pick]))
         return {key: torch.stack([item[key], other[key]]) for key in item}
 
-    def field(self, f: int, t: int, station_km: float) -> Tuple[dict, np.ndarray, np.ndarray]:
-        """One map of time step t of folder f. Stations = its profiles on a regular sub-grid about station_km apart;
-        every other profile with a station within max_km is predicted from its (at most neighbour_casts) nearest
-        stations -> (batch of these profiles, lat of the stations, lon of the stations)."""
+    def stations(self, f: int, t: int, every: Tuple[int, int], layout: str = "grid", coastal_weight: float = 0.05,
+                 coastal_m: float = 200.0, seed: int = 0) -> np.ndarray:
+        """Profiles of time step t of folder f that are given (the stations).
+        "grid": one grid point every `every` (rows, columns). "argo": as many, drawn at random, a coastal column
+        (bottom shallower than coastal_m) being coastal_weight times as likely as a deep-sea one."""
         tyx = self._tyx[f]
         here = np.nonzero(tyx[:, 0] == min(t, int(tyx[:, 0].max())))[0]
-        every_y, every_x = (max(1, int(round(station_km / km))) for km in self.cell_km)
-        stations = here[(tyx[here, 1] % every_y == 0) & (tyx[here, 2] % every_x == 0)]
+        grid = here[(tyx[here, 1] % every[0] == 0) & (tyx[here, 2] % every[1] == 0)]
+        if layout == "grid":
+            return grid
+        weight = np.where(self.coastal(f, coastal_m)[here], coastal_weight, 1.0)
+        rng = np.random.default_rng((self.seed, seed, t, len(grid)))
+        return np.sort(rng.choice(here, size=len(grid), replace=False, p=weight / weight.sum()))
+
+    def position(self, f: int, profiles: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Latitude and longitude of profiles of folder f."""
+        lat, lon = self._ll[f]
+        return lat[profiles], lon[profiles]
+
+    def coastal(self, f: int, coastal_m: float = 200.0) -> np.ndarray:
+        """Per profile of folder f: the column hits the bottom before coastal_m."""
+        valid_len = np.load(self.dirs[f] / "valid_len.npy").astype(np.int64)
+        return self.depth[valid_len - 1] < coastal_m
+
+    def field(self, f: int, stations: np.ndarray) -> Tuple[dict, np.ndarray]:
+        """One map: every other profile of the time step of the stations that has a station within max_km, each
+        given its (at most neighbour_casts) nearest stations -> (batch of these profiles, their indices)."""
+        tyx = self._tyx[f]
         cell = np.full(self._cell[f].shape[1:], -1, dtype=np.int32)
         cell[tyx[stations, 1], tyx[stations, 2]] = stations
-        items = []
-        for j in np.setdiff1d(here, stations):
+        items, targets = [], []
+        for j in np.setdiff1d(np.nonzero(tyx[:, 0] == tyx[stations[0], 0])[0], stations):
             cand, dx, dy = self.around(f, int(j), cell)
             near = np.argsort(np.hypot(dx, dy))[:self.k_max]
             if len(near):
                 items.append(self.sample(f, int(j), cand[near], dx[near], dy[near]))
+                targets.append(int(j))
         if not items:
-            raise SystemExit(f"no profile has a station within {self.max_km:g} km: lower --station-km")
-        lat, lon = self._ll[f]
-        return torch.utils.data.default_collate(items), lat[stations], lon[stations]
+            raise SystemExit(f"no profile has a station within {self.max_km:g} km: use more stations")
+        return torch.utils.data.default_collate(items), np.asarray(targets)
 
 
 def make_dataset(cfg: Config, grid: dict, stats, years, train: bool, **kw) -> ProfileDataset:

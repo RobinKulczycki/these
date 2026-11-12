@@ -87,6 +87,23 @@ meaning here). `neighbour_eval_casts` only changes evaluation; training always d
 of the first profile of every pair, the same profiles as without pairs. `neighbour_pair_weight` (1) weights the
 loss on the difference between the two columns; 0 trains without it (the pairs still share their noise).
 
+### Where the given profiles are: regular grid or Argo-like
+
+Real floats are not on a grid: there are almost none in the coastal area (CMEMS-BLK-QUID-007-010, Fig. 1).
+`figures.py layouts` reconstructs whole maps (snapshots: the stations do not move) from stations on a regular grid,
+one grid point in N each way, and from the same number of stations drawn at random, a coastal column (bottom
+shallower than `--coastal-depth`, 200 m) being `--coastal-weight` (0.05) times as likely as a deep-sea one.
+```bash
+python figures.py layouts $R/v4_nb --out figs/nb_layouts --every 5 10 15 [--steps 0 3 6 9] [--var o2 --depth 50]
+```
+It writes `layouts.csv`, `layouts_error.png` (share of the sea reconstructed, and the error in the whole sea, the deep
+sea and the coastal area) and `layouts_map_1inN.png` (stations, reconstructed map, error). A column further than
+`neighbour_max_km` from every station is not reconstructed, so the errors are compared on the columns that both
+layouts reconstruct and the share of the sea is given next to them. With one station in 10 grid points (~56 km on
+the 5.6 km grid) a 50 km range leaves holes, above all for the Argo-like stations: to reconstruct from sparse
+stations, train with a larger range, e.g. `neighbour_max_km=100 "neighbour_val_km=(10,25,50,75,100)"`.
+The model is trained with casts drawn anywhere around the profile (coastal or not), so that it serves both layouts.
+
 Drift modes: `none`, `shallowest` (minus the shallowest observed value), `lagged` (minus the basin-mean profile of the
 same month over the archive years [Y - drift_lag_years - drift_window_years + 1, Y - drift_lag_years]).
 
@@ -99,6 +116,7 @@ same month over the archive years [Y - drift_lag_years - drift_window_years + 1,
 | Where in the sea? | `maps/maps_*` (per variable, per water-mass layer, oxycline), `maps_<variable>_seasons` (CRPS and bias per season) |
 | Are the error bars right? | `coverage_*`, `spread_skill_*`, `rank_histogram` (flat = calibrated, U = members too close together, dome = too far apart, slope = bias) |
 | Do the members hang together? | `coherence`, `ensemble_all_variables` + `ensemble_coherence.csv`, `field_*` (`neighbours`) |
+| Does it matter where the given profiles are? | `figures.py layouts` (`neighbours`): `layouts_error`, `layouts_map_1inN`, `layouts.csv` |
 | Better than another run? | every figure takes 1-3 runs; `heatmap_change_*`, `maps_crps_change` |
 | The data itself | `data/`, `drift/` (with `--processed-dir`) |
 

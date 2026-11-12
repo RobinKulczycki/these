@@ -15,6 +15,8 @@ Figures from the metrics files (<run>/val_metrics_best.npz, <run>/<split>_metric
   ensemble  members of every variable for a few casts of one run (the same member keeps its colour in every
             panel) + ensemble_coherence.csv: density inversions, distance from the equation of state
   field     "neighbours" only: a whole map predicted from a few stations, with members coherent between profiles
+  layouts   "neighbours" only: maps reconstructed from stations on a regular grid against as many stations placed
+            like Argo floats (at random, mostly in the deep sea), for several numbers of stations
   drift     data only: how the column drifts between years and the bias each drift reference leaves
   all       compare + maps (+ difference) + ensemble (+ field) for the given runs, and data + drift with
             --processed-dir
@@ -1017,6 +1019,38 @@ def smooth_noise(n_members: int, dim: int, shape: Tuple[int, int], cells: Tuple[
     return smooth[:, :, pad[0]:pad[0] + shape[0], pad[1]:pad[1] + shape[1]]
 
 
+def on_map(grid: dict, lat, lon, values: np.ndarray) -> np.ndarray:
+    """Values of profiles, (N,) or (N, M), at their positions -> a map (ny, nx) or (M, ny, nx), NaN elsewhere."""
+    from dataset import nearest_index
+
+    lat_ax, lon_ax = np.asarray(grid["lat"]), np.asarray(grid["lon"])
+    out = np.full(values.shape[1:] + (len(lat_ax), len(lon_ax)), np.nan)
+    out[..., nearest_index(lat_ax, np.asarray(lat, dtype=float)), nearest_index(lon_ax, np.asarray(lon, dtype=float))] = \
+        np.moveaxis(values, 0, -1)
+    return out
+
+
+def draw_field(ax, grid: dict, data: np.ndarray, cmap, norm, sea: np.ndarray, stations=None, title: str = "", label=None):
+    """A map on the model grid, cut to the sea (a map that is finite where there is water); stations = (lat, lon)."""
+    def edges(c):
+        return np.concatenate([[c[0] - (c[1] - c[0]) / 2], 0.5 * (c[1:] + c[:-1]), [c[-1] + (c[-1] - c[-2]) / 2]])
+
+    lat_ax, lon_ax = np.asarray(grid["lat"]), np.asarray(grid["lon"])
+    ys, xs = np.nonzero(np.isfinite(sea))
+    ax.set_facecolor(NODATA)
+    mesh = ax.pcolormesh(edges(lon_ax), edges(lat_ax), np.ma.masked_invalid(data), cmap=cmap, norm=norm)
+    if stations is not None:
+        ax.plot(stations[1], stations[0], ".", color=INK, ms=2.5)
+    ax.set_xlim(edges(lon_ax)[xs.min()], edges(lon_ax)[xs.max() + 1])
+    ax.set_ylim(edges(lat_ax)[ys.min()], edges(lat_ax)[ys.max() + 1])
+    ax.set_aspect(1.0 / np.cos(np.deg2rad(float(lat_ax.mean()))))
+    ax.grid(False)
+    ax.set_title(title, fontsize=11)
+    ax.tick_params(labelsize=8)
+    if label is not None:
+        ax.figure.colorbar(mesh, ax=ax, fraction=0.03, pad=0.02, label=label)
+
+
 def cmd_field(run: str, processed_dir: Optional[str], out: Path, split: str = "val", step: int = 0,
               station_km: float = 60.0, var: str = "o2", depth_m: float = 50.0, noise_km: Optional[float] = None,
               n_members: int = 19) -> None:
@@ -1036,8 +1070,8 @@ def cmd_field(run: str, processed_dir: Optional[str], out: Path, split: str = "v
         raise SystemExit("figures.py field needs a run of experiment=neighbours")
     year = resolve_splits(cfg, load_grid(cfg)["years"])[split][0]
     ds = NeighbourDataset(cfg, grid, stats, [year], train=False, in_memory=False, extras=True, pairs=False)
-    b, st_lat, st_lon = ds.field(0, step, station_km)
-    b = {k: v.to(device) for k, v in b.items()}
+    stations = ds.stations(0, step, tuple(max(1, int(round(station_km / km))) for km in ds.cell_km))
+    b = {k: v.to(device) for k, v in ds.field(0, stations)[0].items()}
     lat_ax, lon_ax = np.asarray(grid["lat"]), np.asarray(grid["lon"])
     iy, ix = (nearest_index(ax, b[k].cpu().numpy().astype(float)) for ax, k in ((lat_ax, "lat"), (lon_ax, "lon")))
     if noise_km:  # (N, M, noise_dim): the smooth noise map read at every profile
@@ -1050,14 +1084,9 @@ def cmd_field(run: str, processed_dir: Optional[str], out: Path, split: str = "v
     own = predict(cfg, grid, stats, model, b, None, n_members)[2]  # every profile draws its own noise
 
     v, k = var_names.index(var), int(np.argmin(np.abs(np.asarray(grid["depth"]) - depth_m)))
-    reach = b["valid_len"].cpu().numpy() > k
-
-    def on_grid(values):  # (N,) or (N, M) at level k -> (ny, nx) or (M, ny, nx), NaN where nothing is predicted
-        g = np.full(values.shape[1:] + (len(lat_ax), len(lon_ax)), np.nan)
-        g[..., iy[reach], ix[reach]] = np.moveaxis(values[reach], 0, -1)
-        return g
-
-    t, s, o = on_grid(truth[:, k, v]), on_grid(coherent[:, :, k, v]), on_grid(own[:, :, k, v])
+    reach = b["valid_len"].cpu().numpy() > k  # columns that reach that depth
+    lat, lon = b["lat"].cpu().numpy()[reach], b["lon"].cpu().numpy()[reach]
+    t, s, o = (on_map(grid, lat, lon, a[reach]) for a in (truth[:, k, v], coherent[:, :, k, v], own[:, :, k, v]))
     mean = s.mean(axis=0)
     level = f"{LONG_NAMES.get(var, var)} at {grid['depth'][k]:.0f} m"
     far = [max(1, int(round(cfg.neighbour_max_km / km))) for km in ds.cell_km]
@@ -1076,28 +1105,137 @@ def cmd_field(run: str, processed_dir: Optional[str], out: Path, split: str = "v
     scales = [(plt.Normalize(float(np.nanpercentile(t, 2)), float(np.nanpercentile(t, 98)) + 1e-9), SEQ)] * 2 \
         + [(TwoSlopeNorm(vmin=-lim, vcenter=0.0, vmax=lim), DIV)] * 4
 
-    def edges(c):
-        return np.concatenate([[c[0] - (c[1] - c[0]) / 2], 0.5 * (c[1:] + c[:-1]), [c[-1] + (c[-1] - c[-2]) / 2]])
-
-    ys, xs = np.nonzero(np.isfinite(t))
     fig, axes = plt.subplots(2, 3, figsize=(17.5, 7.0), squeeze=False)
     for ax, (title, data), (norm, cmap) in zip(axes.flat, panels, scales):
-        ax.set_facecolor(NODATA)
-        mesh = ax.pcolormesh(edges(lon_ax), edges(lat_ax), np.ma.masked_invalid(data), cmap=cmap, norm=norm)
-        ax.plot(st_lon, st_lat, ".", color=INK, ms=2.5)
-        ax.set_xlim(edges(lon_ax)[xs.min()], edges(lon_ax)[xs.max() + 1])
-        ax.set_ylim(edges(lat_ax)[ys.min()], edges(lat_ax)[ys.max() + 1])
-        ax.set_aspect(1.0 / np.cos(np.deg2rad(float(lat_ax.mean()))))
-        ax.grid(False)
-        ax.set_title(title, fontsize=11)
-        ax.tick_params(labelsize=8)
-        fig.colorbar(mesh, ax=ax, fraction=0.03, pad=0.02, label=UNITS.get(var, ""))
+        draw_field(ax, grid, data, cmap, norm, t, ds.position(0, stations), title, UNITS.get(var, ""))
     how = f"noise smooth over {noise_km:g} km" if noise_km else "one noise draw per member for the whole map"
     fig.suptitle(f"{level} mapped from stations {station_km:g} km apart (dots); {how}\nCorrelation between two profiles "
                  + "; ".join(lines).replace("members with noise drawn per profile", "noise per profile"),
                  x=0.01, ha="left", fontweight="bold", fontsize=11)
     fig.tight_layout()
     save(fig, out, f"field_{var}_{grid['depth'][k]:.0f}m" + (f"_noise{noise_km:g}km" if noise_km else ""))
+
+
+def cmd_layouts(run: str, processed_dir: Optional[str], out: Path, split: str = "val", steps: Sequence[int] = (0, 3, 6, 9),
+                every: Sequence[int] = (5, 10, 15), coastal_weight: float = 0.05, coastal_m: float = 200.0,
+                var: str = "o2", depth_m: float = 50.0, n_members: int = 19) -> None:
+    """"neighbours": does it matter where the given profiles are? Whole maps are reconstructed from stations on a
+    regular grid (one grid point every N) and from as many stations placed like Argo floats: at random, a coastal
+    column (bottom shallower than coastal_m) being coastal_weight times as likely as a deep-sea one.
+    Error = CRPS / training std, mean of the variables, on the columns that BOTH layouts reconstruct (a column
+    further than neighbour_max_km from every station is not reconstructed: see the share of the sea).
+    Writes layouts.csv, layouts_error.png and one map figure per N (first time step)."""
+    import torch
+
+    from dataset import NeighbourDataset, load_grid, resolve_splits
+    from metrics import crps_ensemble
+    from train import load_run
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    cfg, grid, stats, model = load_run(Path(run) / "best.pt", [f"processed_dir={processed_dir}"] if processed_dir else [],
+                                       device)
+    if cfg.experiment != "neighbours":
+        raise SystemExit("figures.py layouts needs a run of experiment=neighbours")
+    year = resolve_splits(cfg, load_grid(cfg)["years"])[split][0]
+    ds = NeighbourDataset(cfg, grid, stats, [year], train=False, in_memory=False, extras=True, pairs=False)
+    coastal = ds.coastal(0, coastal_m)
+    k = int(np.argmin(np.abs(np.asarray(grid["depth"]) - depth_m)))
+    noise = torch.randn(n_members, model.noise_dim, generator=torch.Generator().manual_seed(cfg.seed)).to(device)
+    layouts = ("grid", "argo")
+    regions = ("whole sea", "deep sea", "coastal")
+    rows, curves, var_names = [], {name: [] for name in layouts}, None
+
+    def reconstruct(stations):
+        """-> profiles reconstructed, their error per variable (n, V) in training std, truth and member mean of `var`
+        at the depth shown (NaN where the column is shallower)."""
+        b, targets = ds.field(0, stations)
+        b = {key: val.to(device) for key, val in b.items()}
+        names_, truth, members, _ = predict(cfg, grid, stats, model, b, None, n_members, noise)
+        valid = (np.arange(truth.shape[1])[None, :] < b["valid_len"].cpu().numpy()[:, None])[..., None]
+        crps = crps_ensemble(torch.as_tensor(members), torch.as_tensor(truth), dim=1).numpy()  # (n, Z, V)
+        std = np.array([float(stats["std"][list(grid["features"]).index(n)]) for n in names_])
+        error = (crps * valid).sum(axis=1) / valid.sum(axis=1) / std
+        shown = np.where(valid[:, k, 0], 1.0, np.nan)
+        v = names_.index(var)
+        return names_, targets, error, truth[:, k, v] * shown, members[:, :, k, v].mean(axis=1) * shown
+
+    for n_every in every:
+        total = {name: np.zeros((len(regions), 0)) for name in layouts}  # sums over the time steps
+        count, n_sea, n_done, n_stations = np.zeros(len(regions)), 0, {name: 0 for name in layouts}, 0
+        for t in steps:
+            res = {}
+            for name in layouts:
+                stations = ds.stations(0, t, (n_every, n_every), name, coastal_weight, coastal_m)
+                res[name] = (stations,) + reconstruct(stations)
+                n_done[name] += len(res[name][2])
+            var_names = res["grid"][1]
+            both = np.intersect1d(res["grid"][2], res["argo"][2])  # columns reconstructed by the two layouts
+            where = [np.ones(len(both), bool), ~coastal[both], coastal[both]]
+            count += [w.sum() for w in where]
+            n_sea += int((ds._tyx[0][:, 0] == ds._tyx[0][res["grid"][0][0], 0]).sum())
+            n_stations += len(res["grid"][0])
+            for name in layouts:
+                error = res[name][3][np.searchsorted(res[name][2], both)]
+                sums = np.stack([error[w].sum(axis=0) for w in where])
+                total[name] = sums if total[name].size == 0 else total[name] + sums
+            if t == steps[0]:
+                fig_layout_maps(ds, grid, res, coastal, n_every, var, float(grid["depth"][k]), out)
+        for name in layouts:
+            mean = total[name] / np.maximum(count, 1)[:, None]  # (region, variable)
+            share = 100.0 * n_done[name] / max(n_sea - n_stations, 1)
+            curves[name].append([share] + mean.mean(axis=1).tolist())
+            rows.append([f"1 in {n_every}", name, n_stations // len(steps), f"{share:.1f}"]
+                        + [f"{x:.4g}" for x in mean.mean(axis=1)] + [f"{x:.4g}" for x in mean[0]])
+
+    out.mkdir(parents=True, exist_ok=True)
+    with open(out / "layouts.csv", "w", newline="") as fh:
+        wr = csv.writer(fh)
+        wr.writerow(["stations", "layout", "stations per map", "sea reconstructed (%)"]
+                    + [f"error {r} (CRPS/std)" for r in regions] + [f"{n} whole sea (CRPS/std)" for n in var_names])
+        wr.writerows(rows)
+    print((out / "layouts.csv").read_text())
+
+    labels = {"grid": "regular grid", "argo": f"Argo-like (coastal x {coastal_weight:g})"}
+    fig, axes = plt.subplots(1, 4, figsize=(17, 4.2), squeeze=False)
+    titles = ["share of the sea reconstructed (%)"] + [f"error, {r}" for r in regions]
+    for i, (ax, title) in enumerate(zip(axes[0], titles)):
+        for name, color in zip(layouts, SERIES):
+            ax.plot(np.arange(len(every)), [c[i] for c in curves[name]], color=color, marker="o", label=labels[name])
+        ax.set_xticks(np.arange(len(every)))
+        ax.set_xticklabels([f"1 in {n}" for n in every])
+        ax.set_ylim(bottom=0)
+        ax.set_title(title, fontsize=11)
+        ax.set_xlabel("stations: one grid point in N (each way)", fontsize=9)
+    axes[0, 1].set_ylabel("CRPS / training std, mean of the variables", fontsize=9)
+    finish(fig, axes, f"Same number of stations on a grid or placed like Argo floats; error on the columns both "
+                      f"reconstruct ({len(steps)} time steps)", True)
+    fig.subplots_adjust(bottom=0.26)
+    save(fig, out, "layouts_error")
+
+
+def fig_layout_maps(ds, grid: dict, res: dict, coastal: np.ndarray, n_every: int, var: str, depth: float, out: Path):
+    """One row per layout: its stations over the coastal / deep sea, the reconstructed map and its error."""
+    zones = LinearSegmentedColormap.from_list("zones", ["#ecebe7", "#cde2fb"])
+    everywhere = np.nonzero(ds._tyx[0][:, 0] == ds._tyx[0][res["grid"][0][0], 0])[0]
+    sea = on_map(grid, *ds.position(0, everywhere), (~coastal[everywhere]).astype(float))
+    maps = {name: [on_map(grid, *ds.position(0, r[2]), a) for a in (r[4], r[5])] for name, r in res.items()}
+    values = np.concatenate([m[0][np.isfinite(m[0])] for m in maps.values()])
+    norm = plt.Normalize(float(np.percentile(values, 2)), float(np.percentile(values, 98)) + 1e-9)
+    lim = max(float(np.nanpercentile(np.abs(np.stack([m[1] - m[0] for m in maps.values()])), 98)), 1e-9)
+    fig, axes = plt.subplots(2, 3, figsize=(17.5, 7.0), squeeze=False)
+    for row, (name, title) in enumerate((("grid", "regular grid"), ("argo", "placed like Argo floats"))):
+        st = ds.position(0, res[name][0])
+        truth, mean = maps[name]
+        draw_field(axes[row, 0], grid, sea, zones, plt.Normalize(0, 1), sea, st,
+                   f"{len(st[0])} stations, {title} (grey = coastal, blue = deep sea)")
+        draw_field(axes[row, 1], grid, mean, SEQ, norm, sea, st, "reconstructed (mean of the members)", UNITS.get(var, ""))
+        draw_field(axes[row, 2], grid, mean - truth, DIV, TwoSlopeNorm(vmin=-lim, vcenter=0.0, vmax=lim), sea, st,
+                   "reconstructed - truth", UNITS.get(var, ""))
+    fig.suptitle(f"{LONG_NAMES.get(var, var)} at {depth:.0f} m reconstructed from one station in {n_every} grid points "
+                 f"each way (grey inside the sea = further than the range from every station)", x=0.01, ha="left",
+                 fontweight="bold", fontsize=12)
+    fig.tight_layout()
+    save(fig, out, f"layouts_map_1in{n_every}")
 
 
 # --------------------------------------------------------------------------------------- drift diagnostic
@@ -1178,7 +1316,7 @@ def cmd_drift(processed_dir: str, out: Path, lagged: Sequence[str], model_runs: 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
-    for name in ("compare", "maps", "ensemble", "field", "all"):
+    for name in ("compare", "maps", "ensemble", "field", "layouts", "all"):
         s = sub.add_parser(name)
         s.add_argument("runs", nargs="+", help="LABEL=run folder or metrics file (first = reference)")
         s.add_argument("--out", default="figs")
@@ -1195,6 +1333,11 @@ def main() -> None:
         s.add_argument("--depth", type=float, default=50.0, help="field: depth shown (m)")
         s.add_argument("--noise-km", type=float, default=None,
                        help="field: noise smooth over this distance (default: one draw for the whole map)")
+        s.add_argument("--every", type=int, nargs="*", default=[5, 10, 15], help="layouts: one station in N grid points")
+        s.add_argument("--steps", type=int, nargs="*", default=[0, 3, 6, 9], help="layouts: time steps of the year")
+        s.add_argument("--coastal-weight", type=float, default=0.05,
+                       help="layouts: chance of an Argo-like station in a coastal column, relative to a deep-sea one")
+        s.add_argument("--coastal-depth", type=float, default=200.0, help="layouts: coastal = bottom shallower (m)")
     d = sub.add_parser("data")
     d.add_argument("--processed-dir", required=True)
     d.add_argument("--year", type=int, required=True)
@@ -1217,6 +1360,9 @@ def main() -> None:
         return cmd_ensemble(str(run_dirs[0]), a.processed_dir, out, a.row, split=a.split)
     if a.cmd == "field":
         return cmd_field(str(run_dirs[0]), a.processed_dir, out, a.split, a.step, a.station_km, a.var, a.depth, a.noise_km)
+    if a.cmd == "layouts":
+        return cmd_layouts(str(run_dirs[0]), a.processed_dir, out, a.split, a.steps, a.every, a.coastal_weight,
+                           a.coastal_depth, a.var, a.depth)
     runs = [load(s, a.split) for s in a.runs]
     first = metrics_file(a.runs[0], a.split)
     idw = first.with_name(first.stem + "_idw.npz")
