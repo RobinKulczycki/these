@@ -161,10 +161,11 @@ def synthetic(tmp: Path) -> None:
     check(same_metrics(r, metrics(runs / "sparse" / "val_metrics_best.npz")) < 1e-5, "sparse --eval-only reproduces")
 
     print("experiment 3 (neighbours), lagged drift")
-    nb = ["experiment=neighbours", "input_drift_mode=lagged", "neighbour_max_km=100", "neighbour_val_km=(40,70,100)"]
+    nb = ["experiment=neighbours", "input_drift_mode=lagged", "neighbour_max_km=100", "neighbour_val_km=(40,70,100,150)"]
     train("nb", *nb)
     r, idw = metrics(runs / "nb" / "val_metrics_best.npz"), metrics(runs / "nb" / "val_metrics_best_idw.npz")
-    check(str(r["experiment"]) == "neighbours" and (r["v_count"][0].sum(axis=1) > 0).all(), "scores per distance row")
+    n = r["v_count"][0].sum(axis=1)  # the last row lies beyond neighbour_max_km: empty, as when ranges are compared
+    check(str(r["experiment"]) == "neighbours" and (n[:3] > 0).all() and n[3] == 0, "scores per distance row")
     check(np.array_equal(r["v_count"], idw["v_count"]) and int(idw["n_members"]) == 1,
           "IDW baseline scored on the same points")
     check(same_metrics(evaluate("nb"), r) < 1e-5 and same_metrics(metrics(runs / "nb" / "val_metrics_idw.npz"), idw) < 1e-5,
@@ -181,6 +182,7 @@ def synthetic(tmp: Path) -> None:
                            [2005], train=train, in_memory=False) for train in (True, False)]
     casts = [[int((d[i]["src_len"] > 0).sum()) for i in range(0, 400, 7)] for d in ds]
     check(max(casts[0]) > 1 and max(casts[1]) == 1, "neighbour_eval_casts applies to evaluation only")
+    train("nb70", *nb, "neighbour_max_km=70", epochs=1)  # another range, scored on the same rows
     train("nb_bad", *nb, "input_drift_mode=shallowest", epochs=1, ok=False)
     check(True, "neighbours + shallowest drift is refused")
 
@@ -203,6 +205,8 @@ def synthetic(tmp: Path) -> None:
     run("figures.py", "compare", f"1 cast={runs / 'nb' / 'val_metrics_1cast.npz'}", f"1-4 casts={runs / 'nb'}",
         "--out", figs / "nb_casts")
     run("figures.py", "ensemble", runs / "nb", "--row", 1, "--out", figs / "nb")
+    run("figures.py", "compare", f"100 km={runs / 'nb'}", f"70 km={runs / 'nb70'}", "--out", figs / "nb_ranges")
+    run("figures.py", "maps", f"100 km={runs / 'nb'}", f"70 km={runs / 'nb70'}", "--out", figs / "nb_ranges")
     out = run("figures.py", "field", runs / "nb", "--station-km", 90, "--out", figs / "nb_field")
     run("figures.py", "field", runs / "nb", "--station-km", 90, "--noise-km", 150, "--out", figs / "nb_field")
     line = next(x for x in out.splitlines() if "next to each other" in x)  # real error, members, noise per profile
@@ -216,8 +220,8 @@ def synthetic(tmp: Path) -> None:
     run("figures.py", "drift", "--processed-dir", data, "--out", figs / "drift", "--runs", f"cut={runs / 'cut'}",
         "--set", "train_years=(2000,2001,2002,2003,2004)", "val_years=(2005,)", "test_years=(2006,2007)")
     n = {d.name: len(list(d.rglob("*.png"))) for d in figs.iterdir()}
-    check(n["cut"] >= 73 and n["sparse"] >= 69 and n["test_maps"] >= 31 and n["drift"] == 2 and n["nb"] >= 71
-          and n["nb_casts"] >= 36 and n["nb_field"] == 2 and n["nb_layouts"] == 3,
+    check(n["cut"] >= 89 and n["sparse"] >= 85 and n["test_maps"] >= 31 and n["drift"] == 2 and n["nb"] >= 87
+          and n["nb_casts"] >= 52 and n["nb_ranges"] >= 80 and n["nb_field"] == 2 and n["nb_layouts"] == 3,
           f"figures written {n}")
     import figures
 

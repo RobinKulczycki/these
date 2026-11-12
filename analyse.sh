@@ -1,27 +1,47 @@
 #!/bin/bash
-# Every figure and table of the three trained runs, as cluster jobs. Run it once submit.sh has finished:
-#   bash analyse.sh [CUTOFF_RUN SPARSE_RUN NEIGHBOURS_RUN]        default: v4_cutoff v4_sparse v4_nb
-# Figures -> figs/<run>/, job outputs -> logs/. Needs D (processed data) and R (runs), e.g. from ~/tfec/env.sh.
+# Every figure and table of trained runs, as cluster jobs:      bash analyse.sh RUN [RUN ...]
+#   SPLIT=test bash analyse.sh RUN [RUN ...]    the same on the test years (once, at the very end)
+# Figures -> figs/RUN/ (figs/RUN_test/), job outputs -> logs/. Needs D (processed data) and R (runs), e.g. from
+# ~/tfec/env.sh. The split is evaluated first if its metrics file is missing.
+# A "neighbours" run also gets, in sub-folders:
+#   casts/    evaluated with exactly 1, 2 and 4 given columns
+#   layouts/  maps from stations on a grid against Argo-like stations, one station in 3, 5, 10, 15, 20 grid points
+#   field/    maps from stations 30, 60 and 120 km apart, and (60 km) with a member's noise smooth over 25, 50 km
+#             or one draw for the whole sea
 CODE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -f ~/tfec/env.sh ] && . ~/tfec/env.sh
 cd "$CODE" && mkdir -p logs
 set -euo pipefail
-CUT=${1:-v4_cutoff}; SPARSE=${2:-v4_sparse}; NB=${3:-v4_nb}
 R=${R:-$GLOBALSCRATCH/data/runs}
 : "${D:?set D, the processed data folder}"
+: "${1:?usage: bash analyse.sh RUN [RUN ...]}"
+SPLIT=${SPLIT:-val}
 
-job() {  # job NAME "COMMAND" [extra sbatch option] -> job id
+job() {  # job NAME "COMMAND" [sbatch option] -> prints the job id
   sbatch --parsable -J "$1" --gres=gpu:1 -c 4 --mem=48G -t 04:00:00 -o "logs/$1.out" ${3:-} --wrap \
-    "[ -f ~/tfec/env.sh ] && . ~/tfec/env.sh; cd $CODE; export WANDB_MODE=offline; $2"
+    "[ -f ~/tfec/env.sh ] && . ~/tfec/env.sh; cd $CODE; export WANDB_MODE=offline; $2" | cut -d';' -f1
 }
-evaluate="python train.py --eval-only --split val --max-profiles 50000 --set ckpt_dir=$R/$NB processed_dir=$D num_workers=3"
 
-job "figs_$CUT"    "python figures.py all v4=$R/$CUT --out figs/$CUT --processed-dir $D"
-job "figs_$SPARSE" "python figures.py all v4=$R/$SPARSE --out figs/$SPARSE --processed-dir $D"
-job "figs_$NB"     "python figures.py all model=$R/$NB --out figs/$NB --processed-dir $D"
-job "layouts_$NB"  "python figures.py layouts $R/$NB --out figs/$NB/layouts --processed-dir $D --every 5 10 15"
-one=$(job "eval1_$NB" "$evaluate neighbour_eval_casts=1 --tag 1cast")
-four=$(job "eval4_$NB" "$evaluate neighbour_eval_casts=4 --tag 4cast")
-job "casts_$NB" "python figures.py compare '1 cast=$R/$NB/val_metrics_1cast.npz' '4 casts=$R/$NB/val_metrics_4cast.npz' --out figs/$NB/casts" \
-  "--dependency=afterok:${one%%;*}:${four%%;*}"
-echo "submitted: follow with  squeue -u \$USER ; results in $CODE/figs/"
+for NAME in "$@"; do
+  RUN=$R/$NAME
+  TAG=$NAME; [ "$SPLIT" = val ] || TAG=${NAME}_$SPLIT  # name of the jobs and of the figure folder
+  OUT=figs/$TAG
+  [ -f "$RUN/best.pt" ] || { echo "$RUN/best.pt not found: train it first (bash submit.sh $NAME ...)"; exit 1; }
+  evaluate="python train.py --eval-only --split $SPLIT --max-profiles 50000 --set ckpt_dir=$RUN processed_dir=$D num_workers=3"
+  figures="--split $SPLIT --processed-dir $D"
+  after=""
+  [ -f "$RUN/${SPLIT}_metrics.npz" ] || after="--dependency=afterok:$(job "eval_$TAG" "$evaluate")"
+  job "figs_$TAG" "python figures.py all $NAME=$RUN --out $OUT $figures" "$after" > /dev/null
+  if [ "$(python -c "import sys, torch; print(torch.load(sys.argv[1], map_location='cpu', weights_only=False)['cfg']['experiment'])" "$RUN/best.pt")" = neighbours ]; then
+    ids=""
+    for k in 1 2 4; do ids="$ids:$(job "eval${k}_$TAG" "$evaluate neighbour_eval_casts=$k --tag ${k}cast")"; done
+    m=$RUN/${SPLIT}_metrics
+    job "casts_$TAG" "python figures.py compare '1 given=${m}_1cast.npz' '2 given=${m}_2cast.npz' '4 given=${m}_4cast.npz' --out $OUT/casts" \
+      "--dependency=afterok$ids" > /dev/null
+    job "layouts_$TAG" "python figures.py layouts $RUN --out $OUT/layouts $figures --every 3 5 10 15 20" > /dev/null
+    field="python figures.py field $RUN --out $OUT/field $figures"
+    job "field_$TAG" "for km in 30 60 120; do $field --station-km \$km; done; for km in 0 25 50; do $field --station-km 60 --noise-km \$km; done" > /dev/null
+  fi
+  echo "$NAME ($SPLIT): jobs submitted -> $CODE/$OUT"
+done
+echo "follow with:  squeue -u \$USER"

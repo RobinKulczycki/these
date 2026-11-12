@@ -548,7 +548,8 @@ def cmd_compare(runs: Runs, out: Path, max_depth: float = 300.0) -> None:
         save(fig_heatmaps(m0, coord, max_depth=max_depth), out, f"heatmap_crps_{coord}")
         if len(runs) > 1:
             save(fig_heatmaps(m0, coord, other=runs[1][1], max_depth=max_depth), out, f"heatmap_change_{coord}")
-        save(fig_rows(runs, 0, coord, max_depth=max_depth), out, f"o2_per_row_{coord}")
+        for v, name in enumerate(names(m0)):
+            save(fig_rows(runs, v, coord, max_depth=max_depth), out, f"{name}_per_row_{coord}")
     save(fig_by_row(runs, "crps_rel"), out, "crps_by_row")
     save(fig_oxycline(runs), out, "oxycline_by_row")
     for metric in ("bias", "crps"):
@@ -1104,7 +1105,7 @@ def cmd_field(run: str, processed_dir: Optional[str], out: Path, split: str = "v
                  + "; ".join(lines).replace("members with noise drawn per profile", "noise per profile"),
                  x=0.01, ha="left", fontweight="bold", fontsize=11)
     fig.tight_layout()
-    save(fig, out, f"field_{var}_{grid['depth'][k]:.0f}m" + (f"_noise{noise_km:g}km" if explicit else ""))
+    save(fig, out, f"field_{var}_{grid['depth'][k]:.0f}m_stations{station_km:g}km" + (f"_noise{noise_km:g}km" if explicit else ""))
 
 
 def cmd_layouts(run: str, processed_dir: Optional[str], out: Path, split: str = "val", steps: Sequence[int] = (0, 3, 6, 9),

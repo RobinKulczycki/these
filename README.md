@@ -16,7 +16,7 @@ all predicted by the same FGN model and weighted equally in the loss. Three expe
 | `dataset.py`, `model.py`, `metrics.py` | data + drift removal, FGN models, every score |
 | `train.py` | training and `--eval-only`. `Task` is the one place where the experiments differ |
 | `figures.py` | every figure from the metrics files |
-| `run.slurm`, `submit.sh`, `analyse.sh` | cluster jobs: train + evaluate one run; every figure of the three runs |
+| `run.slurm`, `submit.sh`, `analyse.sh` | cluster jobs: train + evaluate one run; every figure of any runs |
 | `test.py` | checks that nothing is broken (~8 min on CPU, synthetic data) |
 
 ## From nothing to every figure
@@ -28,14 +28,24 @@ python test.py                                 # CPU job
 V="input_drift_vars=('thetao','so','sigma0','dissic','ph')"
 bash submit.sh v4_cutoff $B experiment=cutoff input_drift_mode=lagged "$V"
 bash submit.sh v4_sparse $B experiment=sparse input_drift_mode=shallowest "$V"
-bash submit.sh v4_nb $B experiment=neighbours input_drift_mode=lagged neighbour_max_km=100 "neighbour_val_km=(10,25,50,75,100)" "$V"
-bash analyse.sh                                # once the three runs have their val_metrics.npz
-python train.py --eval-only --split test --set ckpt_dir=$R/v4_cutoff processed_dir=$D   # once, at the very end
+bash submit.sh v4_nb $B experiment=neighbours input_drift_mode=lagged neighbour_max_km=100 "neighbour_val_km=(10,25,50,100,150,200)" "$V"
+bash analyse.sh v4_cutoff v4_sparse v4_nb      # once the runs are trained
+SPLIT=test bash analyse.sh v4_cutoff v4_sparse v4_nb   # the test years: once, at the very end
 ```
 `submit.sh NAME` trains `$R/NAME`, then evaluates its best checkpoint on 50,000 validation profiles
-(`$R/NAME/val_metrics.npz`). `analyse.sh` writes `figs/<run>/`. `--eval-only` scores the validation years unless
+(`$R/NAME/val_metrics.npz`). `analyse.sh RUN ...` writes `figs/RUN/` (`figs/RUN_test/`); a `neighbours` run also gets
+`casts/`, `layouts/` and `field/` (see the head of the script). `--eval-only` scores the validation years unless
 `--split test` is given. `$B` in `~/tfec/env.sh` still says `input_drift_mode=basin`, which no longer exists: the
 later `input_drift_mode=` overrides it, or remove it from `B`. W&B runs offline: `wandb sync <run>/wandb/offline-run-*`.
+
+Several `neighbours` set-ups: train one run per set-up with the SAME `neighbour_val_km` (a row beyond a run's
+`neighbour_max_km` stays empty), then compare up to three of them on the same rows:
+```bash
+bash submit.sh nb_50 $B experiment=neighbours input_drift_mode=lagged neighbour_max_km=50 "neighbour_val_km=(10,25,50,100,150,200)" "$V"
+bash submit.sh nb_200 $B experiment=neighbours input_drift_mode=lagged neighbour_max_km=200 "neighbour_val_km=(10,25,50,100,150,200)" "$V"
+python figures.py compare "50 km=$R/nb_50" "100 km=$R/v4_nb" "200 km=$R/nb_200" --out figs/nb_ranges   # login node
+python figures.py maps "50 km=$R/nb_50" "100 km=$R/v4_nb" --out figs/nb_ranges
+```
 
 Drift modes: `none`, `shallowest` (minus the shallowest observed value), `lagged` (minus the basin-mean profile of the
 same month over the archive years [Y - drift_lag_years - drift_window_years + 1, Y - drift_lag_years]).
@@ -45,13 +55,14 @@ same month over the archive years [Y - drift_lag_years - drift_window_years + 1,
 | question | figures |
 |---|---|
 | How good, and where in the column? | `compare/`: `crps_`, `bias_`, `coverage_`, `spread_skill_` + `depth` / `density`; `heatmap_crps_*`, `relative_crps_*`, `summary.csv` |
-| How does the error grow with the row (D_input, spacing, distance to the nearest given column)? | `compare/`: `crps_by_row`, `o2_per_row_*`, `heatmap_crps_*`, `oxycline_by_row` |
+| How does the error grow with the row (D_input, spacing, distance to the nearest given column)? | `compare/`: `crps_by_row`, `<variable>_per_row_*`, `heatmap_crps_*`, `oxycline_by_row` |
 | When? | `compare/`: `time_*` (every month of the evaluation years), `season_*` (calendar month; `_layers` = per water-mass layer), `season_depth_*` (calendar month x depth) |
 | Where in the sea? | `maps/`: `maps_*` (per variable, per water-mass layer, oxycline), `maps_<variable>_seasons` |
 | Are the error bars right? | `compare/`: `coverage_*`, `spread_skill_*`, `rank_histogram` (flat = calibrated, U = members too close together, dome = too far apart, slope = bias) |
 | Do the members hang together? | `compare/coherence`, `ensemble_all_variables` + `ensemble_coherence.csv`, `field_*` (`neighbours`) |
-| `neighbours`: 1 given column or 4? | `casts/` |
+| `neighbours`: 1, 2 or 4 given columns? | `casts/` |
 | `neighbours`: stations on a grid or placed like Argo floats, and how many? | `layouts/`: `layouts_error`, `layouts_map_1inN`, `layouts.csv` |
+| `neighbours`: maps, how far apart the stations are, coherence between columns | `field/`: `field_<variable>_<depth>m_stations<km>km[_noise<km>km]` |
 | The data itself | `data/`, `drift/` |
 
 Every `compare` / `maps` figure takes 1-3 runs of the same experiment:
