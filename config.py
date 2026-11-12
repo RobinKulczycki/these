@@ -84,9 +84,6 @@ class Config:
     neighbour_casts: int = 4
     neighbour_max_km: float = 50.0
     neighbour_eval_casts: Optional[int] = None  # evaluation: exactly this many casts (None: as in training)
-    # A sample is a pair of neighbouring profiles predicted with the same noise; the loss also scores their
-    # difference (x this weight), which is what keeps a member coherent from one column to the next. 0 = off.
-    neighbour_pair_weight: float = 1.0
     neighbour_val_km: Tuple[float, ...] = (10, 20, 30, 40, 50)  # rows: distance of the nearest cast, bin upper edges
 
     # ---- model (FGN: every LayerNorm modulated by a noise vector shared by the whole profile)
@@ -184,9 +181,7 @@ def apply_overrides(cfg: Config, overrides: Optional[Sequence[str]]) -> Config:
             value = ast.literal_eval(raw)
         except (ValueError, SyntaxError):
             value = raw
-        if key == "model_type":  # older command lines; only the FGN model exists now
-            if value != "fgn":
-                raise ValueError("only model_type=fgn exists (the quantile model was removed)")
+        if key == "model_type" and value == "fgn":  # still in older command lines; the only model
             continue
         if key not in names:
             raise KeyError(f"Unknown config key '{key}'")
@@ -194,24 +189,11 @@ def apply_overrides(cfg: Config, overrides: Optional[Sequence[str]]) -> Config:
     return cfg
 
 
-# Fields added after some runs were trained, with the value that reproduces those runs.
-LEGACY_DEFAULTS = {"aux_target_vars": (), "variable_weighting": "o2", "nonnegative_vars": ("o2",)}
-# Fields that change the trained function: a resumed run keeps the checkpoint's value.
+# Settings that change the trained function: a resumed run keeps the checkpoint's value.
 FROZEN_ON_RESUME = ("variable_weighting", "nonnegative_vars", "variable_weights", "experiment")
 
 
 def config_from_checkpoint(ckpt: dict) -> Config:
-    """Config of a saved run, readable for checkpoints of every earlier version of this code."""
-    d = ckpt["cfg"]
-    if str(d.get("model_type", "fgn")).lower() != "fgn":
-        raise SystemExit("this checkpoint is a quantile model, which this code no longer supports")
-    if d.get("input_drift_mode", "none") in ("surface", "basin"):
-        raise SystemExit(f"this checkpoint uses input_drift_mode={d['input_drift_mode']!r}, no longer supported")
+    """Config of a saved run (a setting added to the code since then keeps its default)."""
     names = {f.name for f in dataclasses.fields(Config)}
-    cfg = Config(**{k: v for k, v in d.items() if k in names})
-    for key, value in LEGACY_DEFAULTS.items():
-        if key not in d:
-            setattr(cfg, key, value)
-    if "experiment" not in d:  # runs of train_sparse.py have the sparse query encodings
-        cfg.experiment = "sparse" if "no_obs.weight" in ckpt["model"] else "cutoff"
-    return cfg
+    return Config(**{k: v for k, v in ckpt["cfg"].items() if k in names})

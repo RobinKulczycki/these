@@ -78,7 +78,7 @@ def load(spec: str, split: str = "val") -> Tuple[str, Dict[str, np.ndarray]]:
     label, _, path = spec.partition("=")
     p = metrics_file(spec, split)
     if not p.exists():
-        raise SystemExit(f"{p} not found (a run of older code needs: EVAL=only bash submit.sh NAME)")
+        raise SystemExit(f"{p} not found (evaluate the run first: EVAL=only bash submit.sh NAME)")
     with np.load(p) as f:
         m = {k: f[k] for k in f.files}
     if "v_crps" not in m or "rows" not in m:
@@ -451,7 +451,7 @@ def fig_season_depth(m, metric: str = "crps", max_depth: float = 300.0):
 def fig_rank(runs: Runs):
     """Rank histogram, one panel per variable: where the truth falls among the sorted members. Flat (dashed) =
     calibrated; U-shape = members too close together; dome = too far apart; slope = bias."""
-    runs = [(label, m) for label, m in runs if "rank" in m and is_ensemble(m)]
+    runs = [(label, m) for label, m in runs if is_ensemble(m)]
     m0 = runs[0][1]
     fig, axes = subplots(len(names(m0)), 3.4, 2.6, sharex=True)
     for v, name in enumerate(names(m0)):
@@ -475,31 +475,24 @@ def fig_rank(runs: Runs):
 
 def fig_coherence(runs: Runs):
     """Coherence of the members (metrics.coherence_sums): how much better they predict the difference between two
-    consecutive levels, between two neighbouring predicted columns ("neighbours" only) and between two variables
-    (right, first run) than the same members shuffled.
+    consecutive levels (left) and between two variables (right, first run) than the same members shuffled.
     0 = no better than independent draws, 1 = perfect, below 0 = wrong coherence."""
-    runs = [(label, m) for label, m in runs if "coh_levels" in m and is_ensemble(m)]
+    runs = [(label, m) for label, m in runs if is_ensemble(m)]
     m0 = runs[0][1]
     nv = len(names(m0))
-    bars = [("coh_levels", "Between consecutive levels")]
-    bars += [("coh_columns", "Between neighbouring columns")] if "coh_columns" in m0 else []
-    fig, axes = plt.subplots(1, len(bars) + 1, figsize=(6.6 * len(bars) + 6.6, 5.2), squeeze=False)
+    fig, (ax, ax2) = plt.subplots(1, 2, figsize=(13.5, 5.2), gridspec_kw={"width_ratios": [1.25, 1]})
     width = 0.8 / len(runs)
-    for ax, (key, title) in zip(axes[0], bars):
-        for i, ((label, m), color) in enumerate(zip(runs, SERIES)):
-            if key in m:
-                val = coherence(m[key])
-                shown = [n for n in names(m) if n in names(m0)]
-                xs = [names(m0).index(n) + (i - (len(runs) - 1) / 2) * width for n in shown]
-                ax.bar(xs, [val[names(m).index(n)] for n in shown], width * 0.92, color=color, label=label)
-        ax.axhline(0, color=INK2, lw=0.8)
-        ax.set_xticks(np.arange(nv))
-        ax.set_xticklabels([SHORT_NAMES.get(n, n) for n in names(m0)])
-        ax.set_ylim(min(0.0, ax.get_ylim()[0]), 1.0)
-        ax.set(ylabel="coherence (1 - CRPS as predicted / CRPS shuffled)", title=title)
-        if len(runs) > 1:
-            ax.legend(fontsize=9)
-    ax2 = axes[0, -1]
+    for i, ((label, m), color) in enumerate(zip(runs, SERIES)):
+        val = coherence(m["coh_levels"])
+        xs = [names(m0).index(n) + (i - (len(runs) - 1) / 2) * width for n in names(m) if n in names(m0)]
+        ax.bar(xs, [val[names(m).index(n)] for n in names(m) if n in names(m0)], width * 0.92, color=color, label=label)
+    ax.axhline(0, color=INK2, lw=0.8)
+    ax.set_xticks(np.arange(nv))
+    ax.set_xticklabels([SHORT_NAMES.get(n, n) for n in names(m0)])
+    ax.set_ylim(min(0.0, ax.get_ylim()[0]), 1.0)
+    ax.set(ylabel="coherence (1 - CRPS as predicted / CRPS shuffled)", title="Between consecutive levels")
+    if len(runs) > 1:
+        ax.legend(fontsize=9)
     mat = coherence(m0["coh_variables"]) if nv > 1 else np.full((1, 1), np.nan)
     ax2.set_facecolor(NODATA)
     mesh = ax2.pcolormesh(np.arange(nv + 1) - 0.5, np.arange(nv + 1) - 0.5, np.ma.masked_invalid(mat), cmap=DIV.reversed(),
@@ -532,8 +525,7 @@ def summary_rows(label: str, m) -> List[list]:
         row += [float(pooled(m[f"v_{k}"][v], w)) for k in ("crps", "mae", "bias", "coverage")]
         row.append(row[3] / float(m["var_std"][v]))
         row.append(float(np.sqrt(pooled(m["v_spread"][v] ** 2, w) / pooled(m["v_rmse_ensmean"][v] ** 2, w))))
-        row.append(float(coherence(m["coh_levels"])[v]) if "coh_levels" in m else float("nan"))
-        row.append(float(coherence(m["coh_columns"])[v]) if "coh_columns" in m else float("nan"))
+        row.append(float(coherence(m["coh_levels"])[v]))
         if not is_ensemble(m):  # a single estimate has no coverage, spread or coherence
             row[6], row[8], row[9] = float("nan"), float("nan"), float("nan")
         if "density_edges" in m and len(labs) > 1:
@@ -566,16 +558,14 @@ def cmd_compare(runs: Runs, out: Path, max_depth: float = 300.0) -> None:
         save(fig_season(runs, metric), out, f"season_{metric}")
         if len(m0["layer_edges"]):
             save(fig_season(runs, metric, by_layer=True), out, f"season_{metric}_layers")
-        if "s_count" in m0:  # metrics files written before the seasonal scores existed have none
-            save(fig_season_depth(m0, metric, max_depth), out, f"season_depth_{metric}")
-    if "rank" in m0:
-        save(fig_rank(runs), out, "rank_histogram")
-        save(fig_coherence(runs), out, "coherence")
+        save(fig_season_depth(m0, metric, max_depth), out, f"season_depth_{metric}")
+    save(fig_rank(runs), out, "rank_histogram")
+    save(fig_coherence(runs), out, "coherence")
     labs = layer_labels(m0["layer_edges"]) if "density_edges" in m0 and len(m0["layer_edges"]) else []
     with open(out / "summary.csv", "w", newline="") as fh:
         wr = csv.writer(fh)
         wr.writerow(["run", "variable", "unit", "CRPS", "MAE", "bias", "coverage", "CRPS/std", "spread/skill",
-                     "coherence between levels", "coherence between columns"] + [f"CRPS sigma0 {lab}" for lab in labs])
+                     "coherence between levels"] + [f"CRPS sigma0 {lab}" for lab in labs])
         for label, m in runs:
             wr.writerows([r[:3] + [f"{x:.4g}" for x in r[3:]] for r in summary_rows(label, m)])
     print((out / "summary.csv").read_text())
@@ -703,8 +693,7 @@ def cmd_maps(m, out: Path, other=None, rows=None, min_count: float = 20) -> None
     for v, name in enumerate(names(m)):
         save(fig_maps_layers(m, v, rows, min_count), out, f"maps_{name}_layers")
         save(fig_maps_variable(m, v, rows, min_count), out, f"maps_{name}")
-        if "ms_count" in m:
-            save(fig_maps_seasons(m, v, min_count), out, f"maps_{name}_seasons")
+        save(fig_maps_seasons(m, v, min_count), out, f"maps_{name}_seasons")
     save(fig_maps_oxycline(m, rows), out, "maps_oxycline")
 
 
@@ -935,7 +924,7 @@ def cmd_ensemble(run: str, processed_dir: Optional[str], out: Path, row: Optiona
         row = row if row is not None else (20.0 if cfg.experiment == "sparse" else 50.0)
         key = float(row) if cfg.experiment == "sparse" else cutoff_levels(depth, [row], 1)[0][0]
     ds = make_dataset(cfg, grid, stats, resolve_splits(cfg, load_grid(cfg)["years"])[split], False, max_profiles=2000,
-                      seed=12345, in_memory=False, extras=True, **({"pairs": False} if nb else {}))
+                      seed=12345, in_memory=False, extras=True)
     b = torch.utils.data.default_collate([ds[i] for i in range(len(ds))])
     keep = (b["valid_len"] > int(np.searchsorted(depth, max_depth))) & ((b["src_len"] > 0).any(dim=1) if nb else True)
     deep = {k: v[keep].to(device) for k, v in b.items()}  # profiles that reach max_depth
@@ -1054,9 +1043,10 @@ def draw_field(ax, grid: dict, data: np.ndarray, cmap, norm, sea: np.ndarray, st
 def cmd_field(run: str, processed_dir: Optional[str], out: Path, split: str = "val", step: int = 0,
               station_km: float = 60.0, var: str = "o2", depth_m: float = 50.0, noise_km: Optional[float] = None,
               n_members: int = 19) -> None:
-    """"neighbours": one time step mapped from stations about station_km apart, with members that are coherent
-    between profiles: a member uses ONE noise draw for the whole map (as it does for the whole column), or with
-    noise_km a noise that varies smoothly over that distance. The last panel draws the noise per profile instead.
+    """"neighbours": one time step mapped from stations about station_km apart. The columns are predicted
+    together: a member gives close columns the same noise, which makes it a coherent map. Its noise varies smoothly
+    over noise_km (default neighbour_max_km; 0 = one draw for the whole sea), so columns far apart get different
+    draws. The last panel draws the noise per profile instead, as the scores do.
     Also prints how alike two profiles are in the members and in the real error (their correlation over the map)."""
     import torch
 
@@ -1069,11 +1059,12 @@ def cmd_field(run: str, processed_dir: Optional[str], out: Path, split: str = "v
     if cfg.experiment != "neighbours":
         raise SystemExit("figures.py field needs a run of experiment=neighbours")
     year = resolve_splits(cfg, load_grid(cfg)["years"])[split][0]
-    ds = NeighbourDataset(cfg, grid, stats, [year], train=False, in_memory=False, extras=True, pairs=False)
+    ds = NeighbourDataset(cfg, grid, stats, [year], train=False, in_memory=False, extras=True)
     stations = ds.stations(0, step, tuple(max(1, int(round(station_km / km))) for km in ds.cell_km))
     b = {k: v.to(device) for k, v in ds.field(0, stations)[0].items()}
     lat_ax, lon_ax = np.asarray(grid["lat"]), np.asarray(grid["lon"])
     iy, ix = (nearest_index(ax, b[k].cpu().numpy().astype(float)) for ax, k in ((lat_ax, "lat"), (lon_ax, "lon")))
+    explicit, noise_km = noise_km is not None, cfg.neighbour_max_km if noise_km is None else noise_km
     if noise_km:  # (N, M, noise_dim): the smooth noise map read at every profile
         cells = tuple(noise_km / km for km in ds.cell_km)
         z = smooth_noise(n_members, model.noise_dim, (len(lat_ax), len(lon_ax)), cells, cfg.seed)[:, :, iy, ix]
@@ -1108,12 +1099,12 @@ def cmd_field(run: str, processed_dir: Optional[str], out: Path, split: str = "v
     fig, axes = plt.subplots(2, 3, figsize=(17.5, 7.0), squeeze=False)
     for ax, (title, data), (norm, cmap) in zip(axes.flat, panels, scales):
         draw_field(ax, grid, data, cmap, norm, t, ds.position(0, stations), title, UNITS.get(var, ""))
-    how = f"noise smooth over {noise_km:g} km" if noise_km else "one noise draw per member for the whole map"
+    how = f"noise of a member smooth over {noise_km:g} km" if noise_km else "one noise draw per member for the whole sea"
     fig.suptitle(f"{level} mapped from stations {station_km:g} km apart (dots); {how}\nCorrelation between two profiles "
                  + "; ".join(lines).replace("members with noise drawn per profile", "noise per profile"),
                  x=0.01, ha="left", fontweight="bold", fontsize=11)
     fig.tight_layout()
-    save(fig, out, f"field_{var}_{grid['depth'][k]:.0f}m" + (f"_noise{noise_km:g}km" if noise_km else ""))
+    save(fig, out, f"field_{var}_{grid['depth'][k]:.0f}m" + (f"_noise{noise_km:g}km" if explicit else ""))
 
 
 def cmd_layouts(run: str, processed_dir: Optional[str], out: Path, split: str = "val", steps: Sequence[int] = (0, 3, 6, 9),
@@ -1137,7 +1128,7 @@ def cmd_layouts(run: str, processed_dir: Optional[str], out: Path, split: str = 
     if cfg.experiment != "neighbours":
         raise SystemExit("figures.py layouts needs a run of experiment=neighbours")
     year = resolve_splits(cfg, load_grid(cfg)["years"])[split][0]
-    ds = NeighbourDataset(cfg, grid, stats, [year], train=False, in_memory=False, extras=True, pairs=False)
+    ds = NeighbourDataset(cfg, grid, stats, [year], train=False, in_memory=False, extras=True)
     coastal = ds.coastal(0, coastal_m)
     k = int(np.argmin(np.abs(np.asarray(grid["depth"]) - depth_m)))
     noise = torch.randn(n_members, model.noise_dim, generator=torch.Generator().manual_seed(cfg.seed)).to(device)
@@ -1332,7 +1323,8 @@ def main() -> None:
         s.add_argument("--var", default="o2", help="field: variable shown")
         s.add_argument("--depth", type=float, default=50.0, help="field: depth shown (m)")
         s.add_argument("--noise-km", type=float, default=None,
-                       help="field: noise smooth over this distance (default: one draw for the whole map)")
+                       help="field: distance over which a member's noise varies (default neighbour_max_km; 0 = one "
+                            "draw for the whole sea)")
         s.add_argument("--every", type=int, nargs="*", default=[5, 10, 15], help="layouts: one station in N grid points")
         s.add_argument("--steps", type=int, nargs="*", default=[0, 3, 6, 9], help="layouts: time steps of the year")
         s.add_argument("--coastal-weight", type=float, default=0.05,

@@ -1,13 +1,9 @@
 #!/usr/bin/env python
 """
-Checks that the code works end to end.
+Checks that the code works end to end, on synthetic data and on CPU (~8 min): every experiment and drift mode,
+resume, evaluation, DDP and every figure command.
 
-    python test.py                 synthetic data on CPU (~7 min): every experiment and drift mode, resume,
-                                   evaluation, DDP, old-checkpoint handling and every figure command
-    python test.py --check-run $R/v3_fgn_lag $R/v2_s_fgn_eq --processed-dir $D      (GPU job)
-                                   re-evaluates runs trained by older code and compares with the scores that code
-                                   stored (val_depth_metrics.npz / val_sparse_metrics.npz); also leaves the
-                                   v4 val_metrics.npz in each run for figures.py
+    python test.py [--keep FOLDER]
 """
 from __future__ import annotations
 
@@ -171,8 +167,6 @@ def synthetic(tmp: Path) -> None:
     check(str(r["experiment"]) == "neighbours" and (r["v_count"][0].sum(axis=1) > 0).all(), "scores per distance row")
     check(np.array_equal(r["v_count"], idw["v_count"]) and int(idw["n_members"]) == 1,
           "IDW baseline scored on the same points")
-    check(np.isfinite(r["coh_columns"]).all() and (r["coh_columns"][:, 1] > 0).all() and "coh_columns" not in idw,
-          "coherence between neighbouring columns scored (pairs sharing their noise)")
     check(same_metrics(evaluate("nb"), r) < 1e-5 and same_metrics(metrics(runs / "nb" / "val_metrics_idw.npz"), idw) < 1e-5,
           "neighbours --eval-only reproduces (same casts drawn)")
     run("train.py", "--eval-only", "--split", "val", "--max-profiles", 200, "--tag", "1cast", "--set", f"processed_dir={data}",
@@ -185,12 +179,8 @@ def synthetic(tmp: Path) -> None:
     cfg = apply_overrides(Config(), [f"processed_dir={data}", "neighbour_max_km=100", "neighbour_eval_casts=1"])
     ds = [NeighbourDataset(cfg, load_grid(cfg), load_or_compute_stats(cfg, load_grid(cfg), [2000, 2001, 2002, 2003, 2004]),
                            [2005], train=train, in_memory=False) for train in (True, False)]
-    casts = [[int((d[i]["src_len"][0] > 0).sum()) for i in range(0, 400, 7)] for d in ds]
+    casts = [[int((d[i]["src_len"] > 0).sum()) for i in range(0, 400, 7)] for d in ds]
     check(max(casts[0]) > 1 and max(casts[1]) == 1, "neighbour_eval_casts applies to evaluation only")
-    pair = ds[1][5]  # a profile and its neighbour: next to each other, given the same casts
-    km = float((pair["src_dxy"][0, 0] - pair["src_dxy"][1, 0]).norm())
-    check(pair["x"].shape[0] == 2 and torch.equal(pair["src_x"][0], pair["src_x"][1]) and 0 < km < 70,
-          f"a sample is a pair of neighbouring profiles ({km:.0f} km apart)")
     train("nb_bad", *nb, "input_drift_mode=shallowest", epochs=1, ok=False)
     check(True, "neighbours + shallowest drift is refused")
 
@@ -199,21 +189,6 @@ def synthetic(tmp: Path) -> None:
     train("w2", "input_drift_mode=shallowest", "variable_weights={'o2':2.0}", epochs=1)
     train("bad", "input_drift_mode=basin", epochs=1, ok=False)
     check(True, "input_drift_mode=basin is refused")
-
-    print("checkpoints of older code versions")
-    ck = torch.load(runs / "sparse" / "best.pt", map_location="cpu", weights_only=False)
-    for k in ("experiment", "variable_weights", "drift_lag_years", "density_layers"):
-        ck["cfg"].pop(k, None)
-    ck["cfg"]["model_type"] = "fgn"
-    (runs / "old_sparse").mkdir()
-    torch.save(ck, runs / "old_sparse" / "best.pt")
-    check(same_metrics(evaluate("old_sparse"), metrics(runs / "sparse" / "val_metrics.npz")) < 1e-5,
-          "a sparse run without 'experiment' in its config is recognised and scores the same")
-    ck["cfg"]["model_type"] = "quantile"
-    (runs / "quantile").mkdir()
-    torch.save(ck, runs / "quantile" / "best.pt")
-    run("train.py", "--eval-only", "--set", f"processed_dir={data}", f"ckpt_dir={runs / 'quantile'}", ok=False)
-    check(True, "a quantile checkpoint is refused with a message")
 
     print("DDP (2 CPU processes)")
     run("--nproc_per_node=2", "train.py", "--set", *common, f"ckpt_dir={runs / 'ddp'}", "epochs=1", "experiment=sparse",
@@ -238,15 +213,11 @@ def synthetic(tmp: Path) -> None:
     table = (figs / "nb_layouts" / "layouts.csv").read_text().splitlines()
     check(len(table) == 5 and table[1].split(",")[2] == table[2].split(",")[2],
           "layouts: grid and Argo-like stations, the same number of each")
-    old = {k: v for k, v in metrics(runs / "cut" / "val_metrics.npz").items() if k.split("_")[0] not in ("s", "ms", "rank", "coh")}
-    np.savez(runs / "cut_old_metrics.npz", **old)
-    run("figures.py", "compare", runs / "cut_old_metrics.npz", "--out", figs / "old_file")
-    run("figures.py", "maps", runs / "cut_old_metrics.npz", "--out", figs / "old_file")
     run("figures.py", "drift", "--processed-dir", data, "--out", figs / "drift", "--runs", f"cut={runs / 'cut'}",
         "--set", "train_years=(2000,2001,2002,2003,2004)", "val_years=(2005,)", "test_years=(2006,2007)")
     n = {d.name: len(list(d.rglob("*.png"))) for d in figs.iterdir()}
     check(n["cut"] >= 73 and n["sparse"] >= 69 and n["test_maps"] >= 31 and n["drift"] == 2 and n["nb"] >= 71
-          and n["nb_casts"] >= 36 and n["nb_field"] == 2 and n["nb_layouts"] == 3 and n["old_file"] >= 50,
+          and n["nb_casts"] >= 36 and n["nb_field"] == 2 and n["nb_layouts"] == 3,
           f"figures written {n}")
     import figures
 
@@ -255,51 +226,10 @@ def synthetic(tmp: Path) -> None:
     print(f"\nALL CHECKS PASSED (figures in {figs})")
 
 
-def check_runs(dirs, processed_dir: str, max_profiles: int, tol: float) -> None:
-    sys.path.insert(0, str(CODE))
-    from metrics import pooled
-
-    """v4 re-evaluation of runs trained by older code against the scores that code stored."""
-    worst_all = 0.0
-    for d in map(Path, dirs):
-        old = next((d / f for f in ("val_depth_metrics.npz", "val_sparse_metrics.npz") if (d / f).exists()), None)
-        if old is None:
-            print(f"{d.name}: no val_depth_metrics.npz / val_sparse_metrics.npz to compare with, skipped")
-            continue
-        print(f"{d.name}: evaluating with this code ...")
-        run("train.py", "--eval-only", "--split", "val", "--max-profiles", max_profiles, "--set", f"processed_dir={processed_dir}",
-            f"ckpt_dir={d}")
-        a, b = metrics(old), metrics(d / "val_metrics.npz")
-        check(np.array_equal(a["v_count"], b["v_count"]), f"{d.name}: same profiles and levels scored")
-        worst = 0.0
-        print(f"  {'variable':10s} {'old CRPS':>10s} {'v4 CRPS':>10s}  largest relative difference (all, per row)")
-        for v, name in enumerate(b["variables"]):
-            vo = [str(n) for n in a["variables"]].index(str(name))
-            x = [(pooled(m["v_crps"][i], m["v_count"][i]), pooled(m["v_crps"][i], m["v_count"][i], 1)) for m, i in ((a, vo), (b, v))]
-            rel = float(np.nanmax(np.abs(np.r_[x[1][0], x[1][1]] - np.r_[x[0][0], x[0][1]]) / np.abs(np.r_[x[0][0], x[0][1]])))
-            worst = max(worst, rel)
-            print(f"  {str(name):10s} {x[0][0]:10.5g} {x[1][0]:10.5g}  {rel:.1e}")
-        if "oxycline_crps_m" in a:
-            rel = float(np.nanmax(np.abs(b["oxy_crps"] - a["oxycline_crps_m"]) / np.abs(a["oxycline_crps_m"])))
-            print(f"  {'oxycline':10s} {'':10s} {'':10s}  {rel:.1e}")
-            worst = max(worst, rel)
-        check(worst <= tol, f"{d.name}: largest relative difference {worst:.1e} <= {tol:g}")
-        worst_all = max(worst_all, worst)
-    print(f"\nALL RUNS MATCH (largest relative difference {worst_all:.1e})")
-
-
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--check-run", nargs="*", default=None, metavar="RUN_DIR")
-    p.add_argument("--processed-dir", default=None)
-    p.add_argument("--max-profiles", type=int, default=50_000, help="as used for the stored scores")
-    p.add_argument("--tol", type=float, default=5e-3)
-    p.add_argument("--keep", default=None, help="folder for the synthetic test (default: a temporary one, deleted)")
+    p.add_argument("--keep", default=None, help="folder for the test (default: a temporary one, deleted)")
     a = p.parse_args()
-    if a.check_run is not None:
-        if not a.processed_dir:
-            raise SystemExit("--check-run needs --processed-dir")
-        return check_runs(a.check_run, a.processed_dir, a.max_profiles, a.tol)
     if a.keep:
         shutil.rmtree(a.keep, ignore_errors=True)
         return synthetic(Path(a.keep))

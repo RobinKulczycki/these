@@ -1,9 +1,8 @@
 """
 FGN profile transformer (Alet et al. 2025, as in WeatherNext 2/3). Every LayerNorm is modulated by a noise vector z
 drawn once per member and shared by every level and every variable, so one draw is one coherent profile of all the
-predicted variables (O2 + the auxiliary ones, all from the same head). Giving the same z to several profiles makes
-the member coherent between them too: "neighbours" always does it for neighbouring columns (train.pair_noise,
-Task.pair_loss) and figures.py field for a whole map.
+predicted variables (O2 + the auxiliary ones, all from the same head). Columns predicted together are given the
+same z, which makes the member coherent between them too (train.fgn_members, figures.py field).
 
   encoder  [context] [observed level] ...        observed levels: surface -> D_input ("cutoff") or anywhere ("sparse"),
                                                  or every level of nearby casts ("neighbours")

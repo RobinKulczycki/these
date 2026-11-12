@@ -275,15 +275,12 @@ def nearest_index(axis: np.ndarray, values: np.ndarray) -> np.ndarray:
 class NeighbourDataset(ProfileDataset):
     """Experiment "neighbours": every profile with 1..neighbour_casts other profiles of the same time step within
     neighbour_max_km (the given casts): src_x (K, Z, F), src_len (K,) [0 = no cast], src_ctx (K, C), src_dxy (K, 2)
-    = km east / north of the predicted profile. train=False draws the same casts at every evaluation.
-    pairs=True: a sample is a pair, the profile and a profile next to it that is given the same casts (every array
-    gets a leading axis of 2). The two are predicted with the same noise, so that they stay coherent."""
+    = km east / north of the predicted profile. train=False draws the same casts at every evaluation."""
 
     def __init__(self, cfg: Config, grid: dict, stats: Dict[str, np.ndarray], years: Sequence[int], train: bool = True,
-                 max_profiles: Optional[int] = None, seed: int = 0, in_memory: bool = True, extras: bool = False,
-                 pairs: bool = True):
+                 max_profiles: Optional[int] = None, seed: int = 0, in_memory: bool = True, extras: bool = False):
         super().__init__(cfg, grid, stats, years, max_profiles, seed, in_memory, extras)
-        self.train, self.seed, self.pairs = train, int(seed), pairs
+        self.train, self.seed = train, int(seed)
         self.k_max, self.max_km = int(cfg.neighbour_casts), float(cfg.neighbour_max_km)
         self.depth = np.asarray(grid["depth"], dtype=np.float64)
         self.k_eval = None if train else cfg.neighbour_eval_casts  # evaluation only: exactly this many casts
@@ -341,14 +338,7 @@ class NeighbourDataset(ProfileDataset):
         rng = np.random.default_rng(int(torch.randint(2 ** 62, ())) if self.train else (self.seed, g))
         k = min(int(self.k_eval or rng.integers(1, self.k_max + 1)), len(cand))
         pick = np.sort(rng.choice(len(cand), size=k, replace=False))
-        item = self.sample(f, j, cand[pick], dx[pick], dy[pick])
-        if not self.pairs:
-            return item
-        # the neighbour: a profile next to j (not one of the casts; j itself if there is none), given the same casts
-        beside = np.setdiff1d(np.nonzero(np.hypot(dx, dy) <= 1.5 * max(self.cell_km))[0], pick)
-        p = int(cand[rng.choice(beside)]) if len(beside) else j
-        other = self.sample(f, p, cand[pick], *self.km_from(f, p, cand[pick]))
-        return {key: torch.stack([item[key], other[key]]) for key in item}
+        return self.sample(f, j, cand[pick], dx[pick], dy[pick])
 
     def stations(self, f: int, t: int, every: Tuple[int, int], layout: str = "grid", coastal_weight: float = 0.05,
                  coastal_m: float = 200.0, seed: int = 0) -> np.ndarray:
