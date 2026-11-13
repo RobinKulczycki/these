@@ -18,10 +18,10 @@ Figures from the metrics files (<run>/val_metrics_best.npz, <run>/<split>_metric
   layouts   "neighbours" only: maps reconstructed from stations on a regular grid against as many stations placed
             like Argo floats (at random, mostly in the deep sea), for several numbers of stations
   drift     data only: how the column drifts between years and the bias each drift reference leaves
-  all       compare + maps (+ difference) + ensemble (+ field) for the given runs, and data + drift with
-            --processed-dir
+  all       compare + maps (+ difference) + ensemble (+ field) + data + drift for the given runs
 
-    python figures.py all --out figs --processed-dir $D "new=$R/v4_cutoff" "old=$R/v3_fgn_lag"
+    python figures.py all --out figs/cutoff "new=$R/v5_cutoff" "old=$R/v4_cutoff"
+The data is read from the folder a run was trained on, else from processed_dir of config.py (--processed-dir: another).
 A run may be given as its folder (its <split>_metrics.npz, else val_metrics_best.npz) or as a metrics file.
 "neighbours" runs: the inverse-distance-weighted mean of the same casts (<metrics file>_idw.npz) is added as a run.
 """
@@ -43,6 +43,7 @@ import numpy as np  # noqa: E402
 from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from config import Config  # noqa: E402
 from metrics import LONG_NAMES, SHORT_NAMES, UNITS, coherence, layer_labels, pooled  # noqa: E402
 
 SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100"]
@@ -1220,14 +1221,13 @@ def fig_layout_maps(ds, grid: dict, res: dict, coastal: np.ndarray, n_every: int
     for row, (name, title) in enumerate((("grid", "regular grid"), ("argo", "placed like Argo floats"))):
         st = ds.position(0, res[name][0])
         truth, mean = maps[name]
-        draw_field(axes[row, 0], grid, sea, zones, plt.Normalize(0, 1), sea, st,
-                   f"{len(st[0])} stations, {title} (grey = coastal, blue = deep sea)")
+        draw_field(axes[row, 0], grid, sea, zones, plt.Normalize(0, 1), sea, st, f"{len(st[0])} stations, {title}")
         draw_field(axes[row, 1], grid, mean, SEQ, norm, sea, st, "reconstructed (mean of the members)", UNITS.get(var, ""))
         draw_field(axes[row, 2], grid, mean - truth, DIV, TwoSlopeNorm(vmin=-lim, vcenter=0.0, vmax=lim), sea, st,
                    "reconstructed - truth", UNITS.get(var, ""))
     fig.suptitle(f"{LONG_NAMES.get(var, var)} at {depth:.0f} m reconstructed from one station in {n_every} grid points "
-                 f"each way (grey inside the sea = further than the range from every station)", x=0.01, ha="left",
-                 fontweight="bold", fontsize=12)
+                 f"each way\nleft: grey = coastal, blue = deep sea; other maps: grey inside the sea = further than the "
+                 f"range from every station", x=0.01, ha="left", fontweight="bold", fontsize=12)
     fig.tight_layout()
     save(fig, out, f"layouts_map_1in{n_every}")
 
@@ -1336,13 +1336,13 @@ def main() -> None:
                        help="layouts: chance of an Argo-like station in a coastal column, relative to a deep-sea one")
         s.add_argument("--coastal-depth", type=float, default=200.0, help="layouts: coastal = bottom shallower (m)")
     d = sub.add_parser("data")
-    d.add_argument("--processed-dir", required=True)
+    d.add_argument("--processed-dir", default=Config().processed_dir)
     d.add_argument("--year", type=int, required=True)
     d.add_argument("--step", type=int, default=0, help="index of the day (or month) in the year")
     d.add_argument("--out", default="figs/data")
     d.add_argument("--max-depth", type=float, default=300.0)
     dr = sub.add_parser("drift")
-    dr.add_argument("--processed-dir", required=True)
+    dr.add_argument("--processed-dir", default=Config().processed_dir)
     dr.add_argument("--out", default="figs/drift")
     dr.add_argument("--lagged", nargs="*", default=["1/1", "1/3", "1/5", "2/3"], metavar="LAG/WINDOW")
     dr.add_argument("--runs", nargs="*", default=[], help="LABEL=run: overlay the bias a trained model shows")
@@ -1379,16 +1379,14 @@ def main() -> None:
         cmd_ensemble(str(run_dirs[0]), a.processed_dir, out, a.row, split=a.split)
         if str(runs[0][1]["experiment"]) == "neighbours":
             cmd_field(str(run_dirs[0]), a.processed_dir, out, a.split, a.step, a.station_km, a.var, a.depth, a.noise_km)
-    if a.cmd == "all" and a.processed_dir:
-        splits, year = [], int(json.loads((Path(a.processed_dir) / "grid.json").read_text())["years"][-1])
-        if (run_dirs[0] / "best.pt").exists():  # the split years of the first run
-            import torch
+    if a.cmd == "all" and (run_dirs[0] / "best.pt").exists():  # the data and the split years of the first run
+        import torch
 
-            c = torch.load(run_dirs[0] / "best.pt", map_location="cpu", weights_only=False)["cfg"]
-            splits = [f"{k}_years={tuple(c[k + '_years'])}".replace(" ", "") for k in ("train", "val", "test")]
-            year = int(list(c["val_years"])[0])
-        cmd_data(a.processed_dir, year, 60, out / "data")
-        cmd_drift(a.processed_dir, out / "drift", ["1/1", "1/3", "1/5", "2/3"], runs, splits)
+        c = torch.load(run_dirs[0] / "best.pt", map_location="cpu", weights_only=False)["cfg"]
+        processed = a.processed_dir or c["processed_dir"]
+        splits = [f"{k}_years={tuple(c[k + '_years'])}".replace(" ", "") for k in ("train", "val", "test")]
+        cmd_data(processed, int(list(c["val_years"])[0]), 60, out / "data")
+        cmd_drift(processed, out / "drift", ["1/1", "1/3", "1/5", "2/3"], runs, splits)
 
 
 if __name__ == "__main__":

@@ -7,16 +7,17 @@ all predicted by the same FGN model and weighted equally in the loss. Three expe
 |---|---|---|
 | `cutoff` | the profile from the surface down to D_input | D_input (m) |
 | `sparse` | the profile every `spacing` m | spacing (m) |
-| `neighbours` | 1-4 other columns of the same time step within `neighbour_max_km`, nothing of the column itself | distance to the nearest given column (km) |
+| `neighbours` | 1-4 other columns of the same time step within `neighbour_max_km` (100 km), nothing of the column itself | distance to the nearest given column (km) |
 
 | file | what |
 |---|---|
-| `config.py` | every setting (`--set key=value` on any script) |
+| `config.py` | every setting and its default; `key=value` on a command changes one for that command |
 | `data_download.py`, `preprocess.py` | Copernicus download, raw NetCDF -> profile arrays |
 | `dataset.py`, `model.py`, `metrics.py` | data + drift removal, FGN models, every score |
 | `train.py` | training and `--eval-only`. `Task` is the one place where the experiments differ |
 | `figures.py` | every figure from the metrics files |
-| `run.slurm`, `submit.sh`, `analyse.sh` | cluster jobs: train + evaluate one run; every figure of any runs |
+| `submit.sh`, `analyse.sh`, `run.slurm` | cluster jobs: train + evaluate one run; every figure of any runs |
+| `cluster.sh` | what depends on the cluster: the Python environment and the folder of the runs (`$R`) |
 | `test.py` | checks that nothing is broken (~8 min on CPU, synthetic data) |
 
 ## From nothing to every figure
@@ -25,32 +26,33 @@ all predicted by the same FGN model and weighted equally in the loss. Three expe
 python data_download.py                        # login node, after `copernicusmarine login`
 python preprocess.py --workers 8               # CPU job
 python test.py                                 # CPU job
-V="input_drift_vars=('thetao','so','sigma0','dissic','ph')"
-bash submit.sh v4_cutoff $B experiment=cutoff input_drift_mode=lagged "$V"
-bash submit.sh v4_sparse $B experiment=sparse input_drift_mode=shallowest "$V"
-bash submit.sh v4_nb $B experiment=neighbours input_drift_mode=lagged neighbour_max_km=100 "neighbour_val_km=(10,25,50,100,150,200)" "$V"
-bash analyse.sh v4_cutoff v4_sparse v4_nb      # once the runs are trained
-SPLIT=test bash analyse.sh v4_cutoff v4_sparse v4_nb   # the test years: once, at the very end
+bash submit.sh v5_cutoff experiment=cutoff
+bash submit.sh v5_sparse experiment=sparse
+bash submit.sh v5_nb experiment=neighbours
+bash analyse.sh v5_cutoff v5_sparse v5_nb      # once the runs are trained
+SPLIT=test bash analyse.sh v5_cutoff v5_sparse v5_nb   # the test years: once, at the very end
 ```
-`submit.sh NAME` trains `$R/NAME`, then evaluates its best checkpoint on 50,000 validation profiles
-(`$R/NAME/val_metrics.npz`). `analyse.sh RUN ...` writes `figs/RUN/` (`figs/RUN_test/`); a `neighbours` run also gets
-`casts/`, `layouts/` and `field/` (see the head of the script). `--eval-only` scores the validation years unless
-`--split test` is given. `$B` in `~/tfec/env.sh` still says `input_drift_mode=basin`, which no longer exists: the
-later `input_drift_mode=` overrides it, or remove it from `B`. W&B runs offline: `wandb sync <run>/wandb/offline-run-*`.
-`~/tfec/env.sh` must define `D` (processed data), `R` (runs) and `B`; load it in every new terminal
-(`. ~/tfec/env.sh`) before a command that contains `$D`, `$R` or `$B`. The scripts load it themselves.
+Every setting of these runs is a default of `config.py` (data folder, model size, 20 epochs, EMA, drift removal,
+range of the neighbours ...): a command only names what differs. `submit.sh NAME` trains `$R/NAME`, then evaluates
+its best checkpoint on 50,000 validation profiles (`$R/NAME/val_metrics.npz`). A name that already exists is
+continued, not restarted: use a new name for a new training. `analyse.sh RUN ...` writes `figs/RUN/`
+(`figs/RUN_test/`); a `neighbours` run also gets `casts/`, `layouts/` and `field/` (see the head of the script).
+`--eval-only` scores the validation years unless `--split test` is given. W&B runs offline:
+`wandb sync <run>/wandb/offline-run-*`. The scripts read `cluster.sh` themselves; for a command typed in a terminal
+that contains `$R`, load it first: `. cluster.sh`.
 
-Several `neighbours` set-ups: train one run per set-up with the SAME `neighbour_val_km` (a row beyond a run's
-`neighbour_max_km` stays empty), then compare up to three of them on the same rows:
+Several `neighbours` set-ups: one run per set-up, then up to three of them compared on the same rows
+(`neighbour_val_km` is the same for every range; a row beyond a run's `neighbour_max_km` stays empty):
 ```bash
-bash submit.sh nb_50 $B experiment=neighbours input_drift_mode=lagged neighbour_max_km=50 "neighbour_val_km=(10,25,50,100,150,200)" "$V"
-bash submit.sh nb_200 $B experiment=neighbours input_drift_mode=lagged neighbour_max_km=200 "neighbour_val_km=(10,25,50,100,150,200)" "$V"
-python figures.py compare "50 km=$R/nb_50" "100 km=$R/v4_nb" "200 km=$R/nb_200" --out figs/nb_ranges   # login node
-python figures.py maps "50 km=$R/nb_50" "100 km=$R/v4_nb" --out figs/nb_ranges
+bash submit.sh v5_nb_50 experiment=neighbours neighbour_max_km=50
+bash submit.sh v5_nb_200 experiment=neighbours neighbour_max_km=200
+python figures.py compare "50 km=$R/v5_nb_50" "100 km=$R/v5_nb" "200 km=$R/v5_nb_200" --out figs/nb_ranges   # login node
+python figures.py maps "50 km=$R/v5_nb_50" "100 km=$R/v5_nb" --out figs/nb_ranges
 ```
 
-Drift modes: `none`, `shallowest` (minus the shallowest observed value), `lagged` (minus the basin-mean profile of the
-same month over the archive years [Y - drift_lag_years - drift_window_years + 1, Y - drift_lag_years]).
+Drift removal (`input_drift_mode`): `shallowest` (minus the shallowest observed value; the default of `sparse`),
+`lagged` (minus the basin-mean profile of the same month over the archive years [Y - drift_lag_years -
+drift_window_years + 1, Y - drift_lag_years]; the default of `cutoff` and `neighbours`), `none`.
 
 ## What the figures answer (`figs/<run>/`)
 
@@ -95,8 +97,11 @@ water column: its O2, density, nutrients ... belong together. This holds in the 
 
 Given 1..`neighbour_casts` (4) columns of the same time step within `neighbour_max_km` of a position, predict the
 whole profile there. Every profile of the data is used as a target, its given columns drawn at random among the
-profiles around it (validation always draws the same). Each given column is encoded with its offset (km east, km
-north); the target only gives its context (position, month, bottom depth, MLD, SSH). `neighbour_max_km` is how far
+profiles around it (validation always draws the same). A given column is as likely to be close as far: every
+distance up to `neighbour_max_km` is equally likely (drawn among all the profiles in range alike, most would be far
+away, because there are more of them there, and the model would rarely learn from a close one). Each given column is
+encoded with its offset (km east, km north); the target only gives its context (position, month, bottom depth, MLD,
+SSH). `neighbour_max_km` is how far
 the model may look: the scores are given per distance to the nearest given column (`neighbour_val_km`, bin upper
 edges, the last one >= `neighbour_max_km`). Each evaluation also scores a baseline, the inverse-distance-weighted
 mean of the same columns (`<metrics file>_idw.npz`), which `figures.py` adds to every figure.
@@ -105,8 +110,8 @@ draws 1..`neighbour_casts`. A sample has up to 5x the tokens of a cutoff one: lo
 of memory. Drift: `none` or `lagged`.
 
 ```bash
-python figures.py field $R/v4_nb --out figs/v4_nb --station-km 60 --var o2 --depth 50 [--step 6] [--noise-km 80]
-python figures.py layouts $R/v4_nb --out figs/v4_nb/layouts --every 5 10 15 [--steps 0 3 6 9] [--coastal-weight 0.05]
+python figures.py field $R/v5_nb --out figs/v5_nb --station-km 60 --var o2 --depth 50 [--step 6] [--noise-km 80]
+python figures.py layouts $R/v5_nb --out figs/v5_nb/layouts --every 5 10 15 [--steps 0 3 6 9] [--coastal-weight 0.05]
 ```
 `layouts`: real floats are not on a grid, and there are almost none in the coastal area (CMEMS-BLK-QUID-007-010,
 Fig. 1). Whole maps (snapshots: the stations do not move) are reconstructed from stations on a regular grid, one

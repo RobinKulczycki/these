@@ -122,8 +122,7 @@ def synthetic(tmp: Path) -> None:
     common = [f"processed_dir={data}", "train_years=(2000,2001,2002,2003,2004)", "val_years=(2005,)", "test_years=(2006,2007)",
               "d_model=32", "d_ff=64", "n_heads=4", "n_enc_layers=1", "n_dec_layers=1", "batch_size=32",
               "eval_batch_size=128", "steps_per_epoch=8", "warmup_steps=4", "val_max_profiles=200", "num_workers=0",
-              "log_every=4", "fgn_eval_members=5", "input_drift_vars=('thetao','so','sigma0','dissic','ph')",
-              "drift_window_years=2"]
+              "log_every=4", "fgn_eval_members=5", "drift_window_years=2"]
 
     def train(name, *settings, epochs=2, ok=True):
         return run("train.py", "--set", *common, f"ckpt_dir={runs / name}", f"epochs={epochs}", *settings, ok=ok)
@@ -133,8 +132,8 @@ def synthetic(tmp: Path) -> None:
             f"ckpt_dir={runs / name}", *settings)
         return metrics(runs / name / f"{split}_metrics.npz")
 
-    print("experiment 1 (cutoff), lagged drift")
-    train("cut", "experiment=cutoff", "input_drift_mode=lagged")
+    print("experiment 1 (cutoff), lagged drift (its default)")
+    train("cut", "experiment=cutoff")
     check(all((runs / "cut" / f).exists() for f in ("last.pt", "best.pt", "val_metrics_best.npz")), "checkpoints + scores")
     r = metrics(runs / "cut" / "val_metrics_best.npz")
     check(np.isfinite(r["objective"]) and (r["v_count"].sum(axis=(1, 2)) > 0).all(), "every variable scored")
@@ -146,23 +145,26 @@ def synthetic(tmp: Path) -> None:
     check(np.isfinite(r["coh_levels"]).all() and (r["coh_levels"][:, 1] > 0).all() and r["coh_variables"].shape[2:] == (9, 9),
           "coherence scores (between levels, between variables)")
     check(any(f.startswith("basin_monthly_") for f in os.listdir(data)), "lagged reference cached")
-    out = train("cut", "experiment=cutoff", "input_drift_mode=lagged", "nonnegative_vars=('o2',)", epochs=3)
+    out = train("cut", "experiment=cutoff", "nonnegative_vars=('o2',)", epochs=3)
     ck = torch.load(runs / "cut" / "last.pt", map_location="cpu", weights_only=False)
     check("Resuming from" in out and ck["state"]["epoch"] == 3 and ck["state"]["step"] == 24, "resume: epoch 3, step 24")
     check(len(ck["cfg"]["nonnegative_vars"]) == 3, "resume keeps the output bounds of the checkpoint")
+    check(ck["cfg"]["input_drift_mode"] == "lagged" and ck["ema"] is not None, "cutoff defaults: lagged drift, EMA")
     check(same_metrics(evaluate("cut"), metrics(runs / "cut" / "val_metrics_best.npz")) < 1e-5,
           "--eval-only of best.pt reproduces its validation scores")
     evaluate("cut", "test", 100)
 
-    print("experiment 2 (sparse), shallowest drift")
-    train("sparse", "experiment=sparse", "input_drift_mode=shallowest")
+    print("experiment 2 (sparse), shallowest drift (its default)")
+    out = train("sparse", "experiment=sparse")
+    check("drift shallowest" in out, "sparse default: shallowest drift")
     r = evaluate("sparse")
     check(str(r["experiment"]) == "sparse" and r["observed"].shape == (4, 24), "sparse scores per spacing")
     check(same_metrics(r, metrics(runs / "sparse" / "val_metrics_best.npz")) < 1e-5, "sparse --eval-only reproduces")
 
-    print("experiment 3 (neighbours), lagged drift")
-    nb = ["experiment=neighbours", "input_drift_mode=lagged", "neighbour_max_km=100", "neighbour_val_km=(40,70,100,150)"]
-    train("nb", *nb)
+    print("experiment 3 (neighbours), lagged drift and 100 km (its defaults)")
+    nb = ["experiment=neighbours", "neighbour_val_km=(40,70,100,150)"]
+    out = train("nb", *nb)
+    check("drift lagged" in out, "neighbours default: lagged drift")
     r, idw = metrics(runs / "nb" / "val_metrics_best.npz"), metrics(runs / "nb" / "val_metrics_best_idw.npz")
     n = r["v_count"][0].sum(axis=1)  # the last row lies beyond neighbour_max_km: empty, as when ranges are compared
     check(str(r["experiment"]) == "neighbours" and (n[:3] > 0).all() and n[3] == 0, "scores per distance row")
@@ -177,17 +179,21 @@ def synthetic(tmp: Path) -> None:
     from config import Config, apply_overrides
     from dataset import NeighbourDataset, load_grid, load_or_compute_stats
 
-    cfg = apply_overrides(Config(), [f"processed_dir={data}", "neighbour_max_km=100", "neighbour_eval_casts=1"])
+    cfg = apply_overrides(Config(), [f"processed_dir={data}", "experiment=neighbours", "neighbour_max_km=300",
+                                     "neighbour_eval_casts=1", "drift_window_years=2"])
     ds = [NeighbourDataset(cfg, load_grid(cfg), load_or_compute_stats(cfg, load_grid(cfg), [2000, 2001, 2002, 2003, 2004]),
                            [2005], train=train, in_memory=False) for train in (True, False)]
     casts = [[int((d[i]["src_len"] > 0).sum()) for i in range(0, 400, 7)] for d in ds]
     check(max(casts[0]) > 1 and max(casts[1]) == 1, "neighbour_eval_casts applies to evaluation only")
+    km = np.array([float(np.hypot(*ds[1][i]["src_dxy"][0].numpy())) for i in range(0, len(ds[1]), 5)])
+    near = float((km < 150).mean())  # drawn among all the profiles within 300 km alike, this would be about 0.34
+    check(0.45 < near < 0.7, f"given casts are drawn evenly over distance ({near:.2f} of them in the nearer half)")
     train("nb70", *nb, "neighbour_max_km=70", epochs=1)  # another range, scored on the same rows
     train("nb_bad", *nb, "input_drift_mode=shallowest", epochs=1, ok=False)
     check(True, "neighbours + shallowest drift is refused")
 
-    print("no drift, EMA")
-    train("none", "input_drift_mode=none", "ema_decay=0.9", epochs=1)
+    print("no drift, no EMA")
+    train("none", "input_drift_mode=none", "ema_decay=0", epochs=1)
     train("bad", "input_drift_mode=basin", epochs=1, ok=False)
     check(True, "input_drift_mode=basin is refused")
 
@@ -197,8 +203,8 @@ def synthetic(tmp: Path) -> None:
     check((runs / "ddp" / "val_metrics_best.npz").exists(), "torchrun --nproc_per_node=2")
 
     print("figures")
-    run("figures.py", "all", f"new={runs / 'cut'}", f"other={runs / 'none'}", "--out", figs / "cut", "--processed-dir", data)
-    run("figures.py", "all", f"sparse={runs / 'sparse'}", f"ddp={runs / 'ddp'}", "--out", figs / "sparse")
+    run("figures.py", "all", f"new={runs / 'cut'}", f"other={runs / 'none'}", "--out", figs / "cut")
+    run("figures.py", "all", f"sparse={runs / 'sparse'}", f"ddp={runs / 'ddp'}", "--out", figs / "sparse", "--processed-dir", data)
     run("figures.py", "maps", runs / "cut" / "test_metrics.npz", "--rows", "10", "50", "--out", figs / "test_maps")
     run("figures.py", "all", f"model={runs / 'nb'}", "--out", figs / "nb")
     run("figures.py", "compare", f"1 cast={runs / 'nb' / 'val_metrics_1cast.npz'}", f"1-4 casts={runs / 'nb'}",

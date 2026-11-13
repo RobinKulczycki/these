@@ -275,7 +275,8 @@ def nearest_index(axis: np.ndarray, values: np.ndarray) -> np.ndarray:
 class NeighbourDataset(ProfileDataset):
     """Experiment "neighbours": every profile with 1..neighbour_casts other profiles of the same time step within
     neighbour_max_km (the given casts): src_x (K, Z, F), src_len (K,) [0 = no cast], src_ctx (K, C), src_dxy (K, 2)
-    = km east / north of the predicted profile. train=False draws the same casts at every evaluation."""
+    = km east / north of the predicted profile. A given cast is as likely to be close as far (every distance up to
+    neighbour_max_km is equally likely). train=False draws the same casts at every evaluation."""
 
     def __init__(self, cfg: Config, grid: dict, stats: Dict[str, np.ndarray], years: Sequence[int], train: bool = True,
                  max_profiles: Optional[int] = None, seed: int = 0, in_memory: bool = True, extras: bool = False):
@@ -337,7 +338,10 @@ class NeighbourDataset(ProfileDataset):
         cand, dx, dy = self.around(f, j)
         rng = np.random.default_rng(int(torch.randint(2 ** 62, ())) if self.train else (self.seed, g))
         k = min(int(self.k_eval or rng.integers(1, self.k_max + 1)), len(cand))
-        pick = np.sort(rng.choice(len(cand), size=k, replace=False))
+        # There are more profiles far away than close by (their number grows with the distance): a profile is drawn
+        # with a chance of 1 / distance, which makes every distance equally likely.
+        chance = 1.0 / np.hypot(dx, dy)
+        pick = np.sort(rng.choice(len(cand), size=k, replace=False, p=chance / chance.sum())) if k else []
         return self.sample(f, j, cand[pick], dx[pick], dy[pick])
 
     def stations(self, f: int, t: int, every: Tuple[int, int], layout: str = "grid", coastal_weight: float = 0.05,

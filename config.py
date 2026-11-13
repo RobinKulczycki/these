@@ -42,7 +42,7 @@ class Config:
     # ---- paths
     raw_dir: str = "/globalsc/ulg/sysmod/rkulczyc/data/raw"
     raw_dir_daily: str = "/globalsc/ulg/sysmod/rkulczyc/data/raw_daily"
-    processed_dir: str = "/globalsc/ulg/sysmod/rkulczyc/data/processed_v3"
+    processed_dir: str = "/globalsc/ulg/sysmod/rkulczyc/data/processed_daily_w2_s4_v4"
     ckpt_dir: str = "/globalsc/ulg/sysmod/rkulczyc/data/runs/default"
 
     # ---- download / preprocessing
@@ -52,10 +52,10 @@ class Config:
     lat_max: float = 47.0
     max_depth_m: Optional[float] = 500.0
     include_interim: bool = True
-    temporal_resolution: str = "monthly"  # or "daily" (raw_dir_daily, days_per_week days of every week)
-    days_per_week: int = 1
+    temporal_resolution: str = "daily"  # (raw_dir_daily, days_per_week days of every week) or "monthly"
+    days_per_week: int = 2
     week_day_offset: int = 0
-    spatial_stride: int = 2
+    spatial_stride: int = 4
     min_valid_levels: int = 3
     max_interior_gap_levels: int = 2
     max_bottom_extend_levels: int = 1
@@ -82,16 +82,17 @@ class Config:
     sparse_first_depth_m: Optional[float] = None  # None = one spacing below the surface
     sparse_max_obs_depth_m: Optional[float] = None
     neighbour_casts: int = 4
-    neighbour_max_km: float = 50.0
+    neighbour_max_km: float = 100.0
     neighbour_eval_casts: Optional[int] = None  # evaluation: exactly this many casts (None: as in training)
-    neighbour_val_km: Tuple[float, ...] = (10, 20, 30, 40, 50)  # rows: distance of the nearest cast, bin upper edges
+    neighbour_val_km: Tuple[float, ...] = (10, 25, 50, 100, 150, 200)  # rows: distance of the nearest cast, bin upper
+    #                                      edges; the same for every neighbour_max_km, so that runs can be compared
 
     # ---- model (FGN: every LayerNorm modulated by a noise vector shared by the whole profile)
-    d_model: int = 192
+    d_model: int = 256
     n_heads: int = 8
     n_enc_layers: int = 4
     n_dec_layers: int = 4
-    d_ff: int = 768
+    d_ff: int = 1024
     dropout: float = 0.1
     n_depth_freqs: int = 16
     depth_min_scale_m: float = 2.0
@@ -110,8 +111,9 @@ class Config:
     #   "shallowest": minus the profile's value at its shallowest observed level
     #   "lagged":     minus the basin-mean profile of the same calendar month over archive years
     #                 [year - drift_lag_years - drift_window_years + 1, year - drift_lag_years]
-    input_drift_mode: str = "none"
-    input_drift_vars: Tuple[str, ...] = ("thetao", "so", "sigma0", "dissic", "talk", "ph")
+    #   "none"
+    input_drift_mode: Optional[str] = None  # None = "shallowest" for sparse, "lagged" for cutoff and neighbours
+    input_drift_vars: Tuple[str, ...] = ("thetao", "so", "sigma0", "dissic", "ph")
     drift_lag_years: int = 1
     drift_window_years: int = 3
 
@@ -128,14 +130,14 @@ class Config:
     # ---- optimisation
     batch_size: int = 512
     eval_batch_size: int = 1024
-    epochs: int = 8
+    epochs: int = 20
     steps_per_epoch: Optional[int] = 2000
     lr: float = 3e-4
     min_lr_ratio: float = 0.05
     warmup_steps: int = 2000
     weight_decay: float = 0.05
     grad_clip: float = 1.0
-    ema_decay: float = 0.0  # > 0: validate / save an exponential moving average of the weights
+    ema_decay: float = 0.999  # validate / save an exponential moving average of the weights (0 = the weights)
     amp_dtype: str = "auto"  # bf16 on Ampere+, fp16 on Volta/Turing, fp32 otherwise
     num_workers: int = 8
     in_memory: bool = True
@@ -181,6 +183,8 @@ def apply_overrides(cfg: Config, overrides: Optional[Sequence[str]]) -> Config:
         if key not in names:
             raise KeyError(f"Unknown config key '{key}'")
         setattr(cfg, key, value)
+    if cfg.input_drift_mode is None:
+        cfg.input_drift_mode = "shallowest" if cfg.experiment == "sparse" else "lagged"
     return cfg
 
 
