@@ -12,8 +12,7 @@ all predicted by the same FGN model and weighted equally in the loss. Three expe
 | file | what |
 |---|---|
 | `config.py` | every setting and its default; `key=value` on a command changes one for that command |
-| `data_download.py`, `preprocess.py` | Copernicus download, raw NetCDF -> profile arrays (with the pH correction) |
-| `check_ph.py` | figure and numbers on the pH jumps of a processed folder |
+| `data_download.py`, `preprocess.py` | Copernicus download, raw NetCDF -> profile arrays |
 | `dataset.py`, `model.py`, `metrics.py` | data + drift removal, FGN models, every score |
 | `train.py` | training and `--eval-only`. `Task` is the one place where the experiments differ |
 | `figures.py` | every figure from the metrics files |
@@ -49,16 +48,6 @@ bash submit.sh v5_nb_50 experiment=neighbours neighbour_max_km=50
 bash submit.sh v5_nb_200 experiment=neighbours neighbour_max_km=200
 python figures.py compare "50 km=$R/v5_nb_50" "100 km=$R/v5_nb" "200 km=$R/v5_nb_200" --out figs/nb_ranges   # login node
 python figures.py maps "50 km=$R/v5_nb_50" "100 km=$R/v5_nb" --out figs/nb_ranges
-```
-
-**pH correction.** The pH of the product has a layer, a few levels thick somewhere between ~100 and ~300 m, where
-it is ~7.73 whatever the DIC, with smooth values (~7.1) above and below; the layer follows the density surfaces over
-the whole sea, every year. `preprocess.py` (`fix_ph`) finds it by the jump up of pH from one level to the next and
-replaces it by a straight line in depth between the levels around it. `fix_ph=False` keeps the product as it is.
-A folder processed before the correction existed is corrected without the raw files, and checked, with:
-```bash
-python preprocess.py --from-processed /globalsc/ulg/sysmod/rkulczyc/data/processed_daily_w2_s4_v4   # -> processed_dir
-python check_ph.py > check_ph.txt              # check_ph.png: the profiles, a map, the share of profiles with a jump
 ```
 
 Drift removal (`input_drift_mode`): `shallowest` (minus the shallowest observed value; the default of `sparse`),

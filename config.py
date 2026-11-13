@@ -42,7 +42,7 @@ class Config:
     # ---- paths
     raw_dir: str = "/globalsc/ulg/sysmod/rkulczyc/data/raw"
     raw_dir_daily: str = "/globalsc/ulg/sysmod/rkulczyc/data/raw_daily"
-    processed_dir: str = "/globalsc/ulg/sysmod/rkulczyc/data/processed_daily_w2_s4_v5"
+    processed_dir: str = "/globalsc/ulg/sysmod/rkulczyc/data/processed_daily_w2_s4_v4"
     ckpt_dir: str = "/globalsc/ulg/sysmod/rkulczyc/data/runs/default"
 
     # ---- download / preprocessing
@@ -65,7 +65,6 @@ class Config:
     target_var: str = "o2"
     log_transform_vars: Tuple[str, ...] = ("chl",)
     log_eps: float = 1e-3
-    fix_ph: bool = True  # replace the layer where the pH of the product is wrong (preprocess.py: fix_ph)
 
     # ---- chronological splits
     train_years: Sequence[int] = tuple(range(1993, 2019))

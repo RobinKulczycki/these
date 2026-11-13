@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
-Checks that the code works end to end, on synthetic data and on CPU (~8 min): the pH correction, every experiment
-and drift mode, resume, evaluation, DDP and every figure command.
+Checks that the code works end to end, on synthetic data and on CPU (~8 min): every experiment and drift mode,
+resume, evaluation, DDP and every figure command.
 
     python test.py [--keep FOLDER]
 """
@@ -41,7 +41,7 @@ def check(cond, what: str) -> None:
 def synthetic_data(out: Path, years=range(2000, 2008)) -> None:
     """Black-Sea-like profiles: isopycnals dome in two gyres, O2 / NO3 / PO4 follow sigma0, the upper layer drifts.
     As in the reanalysis, what differs from one profile to the next varies slowly over the sea and with depth, so
-    that neighbouring profiles (and levels) resemble each other, and pH has a layer where it is 0.6 too high."""
+    that neighbouring profiles (and levels) resemble each other."""
     rng = np.random.default_rng(0)
     depth = np.array([2.5, 5, 7.5, 10, 15, 20, 25, 30, 40, 50, 60, 70, 80, 90, 100, 115, 130, 150, 175, 200, 250, 300,
                       400, 500])
@@ -73,7 +73,6 @@ def synthetic_data(out: Path, years=range(2000, 2008)) -> None:
                                 np.log10(0.05 + 1.2 * np.exp(-((depth - 30) / 20) ** 2) + 1e-3),
                                 6 * np.exp(-((sig - 15.4) / 0.3) ** 2) + 0.1, 0.05 + 6 / (1 + np.exp(-(sig - 16) / 0.15)),
                                 3 + 0.12 * (sig - 11) + 0.004 * drift, 8.3 - 0.13 * (sig - 11)], axis=-1)
-                arr[(sig > 16.2) & (sig < 16.7), 8] += 0.6  # the layer of the product where pH is wrong
                 vl = max(int(np.searchsorted(depth, bottom[iy, ix], side="right")), 3)
                 arr[vl:] = 0
                 rows.append((arr, vl, [lat[iy], lon[ix], np.sin(2 * np.pi * month / 12), np.cos(2 * np.pi * month / 12),
@@ -118,28 +117,8 @@ def synthetic(tmp: Path) -> None:
     import torch
 
     data, runs, figs = tmp / "data", tmp / "runs", tmp / "figs"
-    print("synthetic data, pH correction")
-    synthetic_data(tmp / "data_product")
-    run("preprocess.py", "--from-processed", tmp / "data_product", "--set", f"processed_dir={data}")
-    old, new = (np.load(d / "year_2005" / "profiles.npy") for d in (tmp / "data_product", data))
-
-    def rises(a):  # share of the profiles whose pH rises by more than 0.1 between two levels below 60 m
-        return float((np.diff(a[:, 10:, 8], axis=1) > 0.1).any(axis=1).mean())
-
-    check(rises(old) > 0.5 and rises(new) == 0 and np.array_equal(old[:, :, :8], new[:, :, :8])
-          and json.loads((data / "grid.json").read_text())["fix_ph"],
-          f"the pH layer ({100 * rises(old):.0f} % of the profiles) is removed, nothing else changes")
-    sys.path.insert(0, str(CODE))
-    from preprocess import fix_ph
-
-    depth = np.asarray(json.loads((data / "grid.json").read_text())["depth"])
-    smooth = np.tile(7.1 + 1.2 / (1 + np.exp((depth - 60) / 12)), (3, 1)).astype(np.float32)
-    ph = smooth.copy()
-    ph[0, 15:18], ph[1, 19:] = 7.73, 7.73  # a layer between good levels; a layer down to the seafloor (22 levels)
-    fixed, replaced = fix_ph(ph, np.array([24, 22, 24]), depth)
-    check(np.abs(fixed - smooth)[:, :22].max() < 0.05 and replaced[0, 15:18].all() and replaced[1, 19:22].all()
-          and replaced.sum() == 6 and np.array_equal(fixed[2], ph[2]),
-          "pH layer: replaced by a line between the levels around it, a smooth profile is left as it is")
+    print("synthetic data ...")
+    synthetic_data(data)
     common = [f"processed_dir={data}", "train_years=(2000,2001,2002,2003,2004)", "val_years=(2005,)", "test_years=(2006,2007)",
               "d_model=32", "d_ff=64", "n_heads=4", "n_enc_layers=1", "n_dec_layers=1", "batch_size=32",
               "eval_batch_size=128", "steps_per_epoch=8", "warmup_steps=4", "val_max_profiles=200", "num_workers=0",
@@ -196,6 +175,7 @@ def synthetic(tmp: Path) -> None:
     run("train.py", "--eval-only", "--split", "val", "--max-profiles", 200, "--tag", "1cast", "--set", f"processed_dir={data}",
         f"ckpt_dir={runs / 'nb'}", "neighbour_eval_casts=1")
     check((runs / "nb" / "val_metrics_1cast_idw.npz").exists(), "evaluation with exactly one cast (--tag)")
+    sys.path.insert(0, str(CODE))
     from config import Config, apply_overrides
     from dataset import NeighbourDataset, load_grid, load_or_compute_stats
 
