@@ -6,6 +6,8 @@ Physics is interpolated onto the BGC levels and extended at most max_bottom_exte
 interior gaps of <= max_interior_gap_levels are filled, and each profile stops at its first missing value.
 
     python preprocess.py --workers 4 [--years 1993 1994] [--set spatial_stride=1 max_depth_m=500]
+    python preprocess.py --from-processed OLD_FOLDER      a folder made before the pH correction existed (fix_ph)
+                                                          -> processed_dir, with the correction; no raw file is read
 """
 from __future__ import annotations
 
@@ -13,6 +15,7 @@ import argparse
 import json
 import logging
 import re
+import shutil
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import reduce
 from pathlib import Path
@@ -27,6 +30,7 @@ from config import (DATASET_GROUPS, DERIVED_FEATURES, PHYSICAL_FEATURES, REFEREN
 log = logging.getLogger("preprocess")
 CHUNK = 32_768  # profiles per chunk for the vectorised gap filling (bounds peak memory)
 CONTEXT_BASE = ["lat", "lon", "month_sin", "month_cos", "log_bottom_depth"]
+PH_STEP, PH_BELOW_M = 0.1, 60.0  # fix_ph: a jump of pH between two consecutive levels; looked for below this depth
 
 
 # --------------------------------------------------------------------------------------- bookkeeping
@@ -192,6 +196,66 @@ def ffill_levels(a: np.ndarray, limit: int) -> np.ndarray:
     return np.where(fill, np.take_along_axis(a, np.clip(prev, 0, None), axis=1), a)
 
 
+# --------------------------------------------------------------------------------------- pH of the product
+def fix_ph(ph: np.ndarray, valid_len: np.ndarray, depth: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """The pH of the product has a layer, a few levels thick somewhere between ~100 and ~300 m, where it is ~7.73
+    whatever the DIC, with smooth values (~7.1) just above and below it: pH jumps up by ~0.6 from one level to the
+    next and back down further below. The layer follows the density surfaces over the whole sea, every year.
+
+    The layer = from the first rise of more than PH_STEP between two consecutive levels (below PH_BELOW_M; pH never
+    rises that much with depth otherwise) to the last fall of more than PH_STEP below it, or to the seafloor if pH
+    does not come back down. Its values are replaced by a straight line in depth between the level above and the
+    level below (by the value of the level above if it reaches the seafloor).
+    ph (n, Z), valid_len (n,) -> (corrected pH, replaced levels (n, Z))."""
+    n, nz = ph.shape
+    lev = np.arange(nz)
+    step = np.diff(ph, axis=1)  # step[:, z] = ph[:, z + 1] - ph[:, z]
+    pair = (lev[None, 1:] < valid_len[:, None]) & (depth[:-1] >= PH_BELOW_M)[None, :]  # both levels exist
+    rise, fall = (step > PH_STEP) & pair, (step < -PH_STEP) & pair
+
+    def last(a):  # index of the last True of each row, -1 if none
+        return np.where(a.any(axis=1), nz - 2 - a[:, ::-1].argmax(axis=1), -1)
+
+    above = np.where(rise.any(axis=1), rise.argmax(axis=1), nz)  # last level above the layer (nz: no layer)
+    below = np.where(last(fall) > last(rise), last(fall) + 1, valid_len)  # first level below it (valid_len: none)
+    replaced = (lev[None, :] > above[:, None]) & (lev[None, :] < np.minimum(below, valid_len)[:, None])
+    rows, a, b = np.arange(n), np.minimum(above, nz - 1), np.minimum(below, nz - 1)
+    top = ph[rows, a]
+    bottom = np.where(below < valid_len, ph[rows, b], top)
+    w = (depth[None, :] - depth[a][:, None]) / np.maximum(depth[b] - depth[a], 1e-6)[:, None]
+    line = top[:, None] + np.clip(w, 0.0, 1.0) * (bottom - top)[:, None]
+    return np.where(replaced, line, ph).astype(ph.dtype), replaced
+
+
+def log_fix(year: int, replaced: np.ndarray) -> None:
+    n = int(replaced.any(axis=1).sum())
+    log.info("%d: pH corrected in %.1f %% of the profiles, %.1f levels in each of them", year,
+             100.0 * n / max(len(replaced), 1), replaced.sum() / max(n, 1))
+
+
+def correct_existing(old: Path, out_dir: Path) -> None:
+    """Copy of a processed folder made before fix_ph existed, with the pH corrected (nothing else changes)."""
+    grid = json.loads((old / "grid.json").read_text())
+    if grid.get("fix_ph") or old.resolve() == out_dir.resolve():
+        raise SystemExit(f"{old} is already corrected, or is the folder to write: give the old folder, and "
+                         "--set processed_dir=NEW_FOLDER if the new one is not the processed_dir of config.py")
+    depth, i = np.asarray(grid["depth"], dtype=np.float64), list(grid["features"]).index("ph")
+    for year in grid["years"]:
+        src, dst = old / f"year_{year}", out_dir / f"year_{year}"
+        if (dst / "_DONE").exists():
+            continue
+        dst.mkdir(parents=True, exist_ok=True)
+        arr = np.load(src / "profiles.npy")
+        arr[:, :, i], replaced = fix_ph(arr[:, :, i], np.load(src / "valid_len.npy").astype(np.int64), depth)
+        np.save(dst / "profiles.npy", arr)
+        for name in ("valid_len.npy", "context.npy", "meta.npz"):
+            shutil.copyfile(src / name, dst / name)
+        (dst / "_DONE").touch()
+        log_fix(int(year), replaced)
+    (out_dir / "grid.json").write_text(json.dumps({**grid, "fix_ph": True}))
+    log.info("Done: %s", out_dir)
+
+
 # --------------------------------------------------------------------------------------- one year
 def process_year(cfg: Config, year: int, raw_dir: Path, out_dir: Path, ref: dict) -> int:
     ydir = out_dir / f"year_{year}"
@@ -263,6 +327,10 @@ def process_year(cfg: Config, year: int, raw_dir: Path, out_dir: Path, ref: dict
     keep = valid_len >= cfg.min_valid_levels
     arr, valid_len, flat = arr[keep], valid_len[keep], flat[keep]
     arr[np.arange(nz)[None, :] >= valid_len[:, None]] = 0.0
+    if cfg.fix_ph and "ph" in feats:  # 5) the layer where the pH of the product is wrong
+        i = feats.index("ph")
+        arr[:, :, i], replaced = fix_ph(arr[:, :, i], valid_len.astype(np.int64), depth)
+        log_fix(year, replaced)
 
     # context: position, season, bathymetry proxy, 2-D physics
     t_idx, y_idx, x_idx = np.unravel_index(flat, (nt, ny, nx))
@@ -296,12 +364,17 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=1, help="years processed in parallel (RAM ~5-10 GB each)")
     parser.add_argument("--years", type=int, nargs="*", default=None, help="restrict to these years")
     parser.add_argument("--force", action="store_true", help="overwrite grid.json if the configuration changed")
+    parser.add_argument("--from-processed", default=None, metavar="OLD_FOLDER",
+                        help="copy a processed folder made before the pH correction existed, with the correction")
     parser.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     cfg = apply_overrides(Config(), args.set)
     raw_dir, out_dir = Path(raw_root(cfg)), Path(cfg.processed_dir)
+    if args.from_processed:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return correct_existing(Path(args.from_processed), out_dir)
     record = raw_dir / "download_weekdays.json"
     if cfg.temporal_resolution == "daily" and record.exists():
         have = set(json.loads(record.read_text())["kept_weekdays"])
@@ -334,6 +407,7 @@ def main() -> None:
         "target": cfg.target_var,
         "target_index": list(cfg.profile_features).index(cfg.target_var),
         "log_transform_vars": [v for v in cfg.log_transform_vars if v in cfg.profile_features],
+        "fix_ph": bool(cfg.fix_ph and "ph" in cfg.profile_features),
         "spatial_stride": cfg.spatial_stride,
         "max_depth_m": cfg.max_depth_m,
         "lat": ref["lat"].tolist(),

@@ -1,10 +1,12 @@
 #!/usr/bin/env python
 """
-TEMPORARY check of the pH profiles, which jump back and forth below ~150 m: how often, where, in which years,
-and is it already in the raw Copernicus files? Reads the data only, changes nothing.
+Check of the pH profiles of a processed folder: do they jump back and forth below ~100 m, how often, where, in
+which years, and is it already in the raw Copernicus files? Reads the data only, changes nothing.
 
     python check_ph.py > check_ph.txt        (login node, a few minutes; also writes check_ph.png)
-    python check_ph.py --year 2019 --lat 43 --lon 34 [--set processed_dir=... raw_dir_daily=...]
+    python check_ph.py --year 2019 --lat 43 --lon 34 --out check_ph.png [--set processed_dir=... raw_dir_daily=...]
+The folder is processed_dir of config.py (pH corrected by preprocess.py: fix_ph); to see the product as it is,
+give the folder made before the correction with --set processed_dir=...
 
 A "big step" of a variable = a change of more than 20 % of its range between two consecutive levels.
 """
@@ -52,6 +54,7 @@ def main() -> None:
     p.add_argument("--year", type=int, default=2019)
     p.add_argument("--lat", type=float, default=43.0)
     p.add_argument("--lon", type=float, default=34.0)
+    p.add_argument("--out", default="check_ph.png")
     p.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE")
     a = p.parse_args()
     cfg = apply_overrides(Config(), a.set)
@@ -162,10 +165,10 @@ def main() -> None:
     fig.colorbar(sc, ax=axes[2])
     axes[2].set(title=f"pH at {depth[z200]:.0f} m, {day}", xlabel="longitude", ylabel="latitude")
     axes[3].bar(list(per_year), list(per_year.values()), color="#2a78d6")
-    axes[3].set(title=f"profiles with a big step up of pH below {BELOW:.0f} m", xlabel="year", ylabel="%")
+    axes[3].set(title=f"profiles with a big step up of pH below {BELOW:.0f} m", xlabel="year", ylabel="%", ylim=(0, 100))
     fig.tight_layout()
-    fig.savefig("check_ph.png", dpi=130)
-    print("\nfigure: check_ph.png")
+    fig.savefig(a.out, dpi=130)
+    print(f"\nfigure: {a.out}")
 
 
 if __name__ == "__main__":
