@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 PRODUCT_BGC = "BLKSEA_MULTIYEAR_BGC_007_005"  # BAMHBI biogeochemistry, 59 levels
@@ -102,14 +102,9 @@ class Config:
     fgn_train_members: int = 2
     fgn_eval_members: int = 19  # the member range is a 90 % interval when calibrated
     fgn_member_chunk: int = 0  # members per forward pass in evaluation, 0 = automatic
-    fgn_crps_alpha: float = 1.0  # 1 = fair CRPS
-    fgn_epistemic_dropout: bool = False  # independent dropout masks per member at evaluation
 
     # ---- targets and loss
     aux_target_vars: Tuple[str, ...] = ("thetao", "so", "sigma0", "chl", "no3", "po4", "dissic", "ph")
-    variable_weighting: str = "equal"  # "equal": mean over variables; "o2": O2 + aux_loss_weight x mean aux
-    variable_weights: Dict[str, float] = field(default_factory=dict)  # with "equal", e.g. {'o2': 2.0}
-    aux_loss_weight: float = 0.5
 
     # ---- drift removal of input_drift_vars (inputs and targets; O2 never)
     #   "shallowest": minus the profile's value at its shallowest observed level
@@ -190,7 +185,7 @@ def apply_overrides(cfg: Config, overrides: Optional[Sequence[str]]) -> Config:
 
 
 # Settings that change the trained function: a resumed run keeps the checkpoint's value.
-FROZEN_ON_RESUME = ("variable_weighting", "nonnegative_vars", "variable_weights", "experiment")
+FROZEN_ON_RESUME = ("nonnegative_vars", "experiment")
 
 
 def config_from_checkpoint(ckpt: dict) -> Config:

@@ -354,6 +354,10 @@ class NeighbourDataset(ProfileDataset):
         rng = np.random.default_rng((self.seed, seed, t, len(grid)))
         return np.sort(rng.choice(here, size=len(grid), replace=False, p=weight / weight.sum()))
 
+    def n_steps(self, f: int) -> int:
+        """Number of time steps (days or months) of folder f."""
+        return int(self._tyx[f][:, 0].max()) + 1
+
     def position(self, f: int, profiles: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Latitude and longitude of profiles of folder f."""
         lat, lon = self._ll[f]

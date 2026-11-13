@@ -46,14 +46,13 @@ def _pair_sum(srt: torch.Tensor, dim: int) -> torch.Tensor:
     return (srt * weight).sum(dim=dim)
 
 
-def crps_ensemble(samples: torch.Tensor, target: torch.Tensor, alpha: float = 1.0, dim: int = 1) -> torch.Tensor:
-    """(Almost-)fair CRPS, members along `dim`: alpha = 1 fair CRPS, alpha < 1 mixes in the empirical one."""
+def crps_ensemble(samples: torch.Tensor, target: torch.Tensor, dim: int = 1) -> torch.Tensor:
+    """Fair CRPS of an ensemble, members along `dim`."""
     m = samples.shape[dim]
     skill = (samples - target.unsqueeze(dim)).abs().mean(dim=dim)
     if m < 2:
         return skill
-    eps = (1.0 - float(alpha)) / m
-    return skill - (1.0 - eps) * _pair_sum(samples.sort(dim=dim).values, dim) / (m * (m - 1))
+    return skill - _pair_sum(samples.sort(dim=dim).values, dim) / (m * (m - 1))
 
 
 def mean_member_distance(samples: torch.Tensor, dim: int = 1) -> torch.Tensor:
@@ -76,7 +75,7 @@ def point_metrics(samples: torch.Tensor, y: torch.Tensor, tol: float) -> Dict[st
     srt = samples.sort(dim=1).values
     median = srt[:, m // 2] if m % 2 else 0.5 * (srt[:, m // 2 - 1] + srt[:, m // 2])
     mean = samples.mean(dim=1)
-    return {"pinball": 0.5 * crps_ensemble(samples, y, 1.0, dim=1), "abs_err": (y - median).abs(),
+    return {"pinball": 0.5 * crps_ensemble(samples, y), "abs_err": (y - median).abs(),
             "sq_err": (y - median) ** 2, "bias": median - y,
             "covered": (y >= srt[:, 0] - tol) & (y <= srt[:, -1] + tol),
             "ens_var": ((samples - mean.unsqueeze(1)) ** 2).sum(dim=1) / max(m - 1, 1), "sq_err_mean": (y - mean) ** 2}
@@ -183,7 +182,7 @@ class OxyclineAccumulator:
 
         def score(pred, true):
             covered = (true >= pred.min(dim=1).values) & (true <= pred.max(dim=1).values)
-            return crps_ensemble(pred, true, 1.0, dim=1), (true - ensemble_median(pred, dim=1)).abs(), covered
+            return crps_ensemble(pred, true), (true - ensemble_median(pred, dim=1)).abs(), covered
 
         crps, abs_err, covered = score(z_mem, zt)
         values = {"crps": crps, "abs_err": abs_err, "covered": covered.double(), "count": torch.ones_like(zt)}
@@ -208,27 +207,12 @@ def layer_labels(edges: Sequence[float]):
     return [f"<{e[0]}"] + [f"{a}-{b}" for a, b in zip(e[:-1], e[1:])] + [f">{e[-1]}"] if e else ["all"]
 
 
-def loss_weights(cfg, names: Sequence[str]) -> Optional[np.ndarray]:
-    """Weight of every predicted variable in the loss and the validation objective (sum 1); None = "o2" weighting."""
-    if str(cfg.variable_weighting).lower() != "equal" or len(names) < 2:
-        return None
-    extra = dict(cfg.variable_weights or {})
-    unknown = [k for k in extra if k not in names]
-    if unknown:
-        raise ValueError(f"variable_weights names {unknown} are not predicted variables {list(names)}")
-    w = np.asarray([float(extra.get(n, 1.0)) for n in names], dtype=np.float64)
-    if (w < 0).any() or w.sum() <= 0:
-        raise ValueError(f"variable_weights must be >= 0 with a positive sum, got {extra}")
-    return w / w.sum()
-
-
-def combine_losses(cfg, loss_o2, loss_aux, weights=None):
-    """weights: sum of weight x loss; None: O2 loss + aux_loss_weight x mean auxiliary loss."""
+def combine_losses(loss_o2, loss_aux):
+    """The loss: mean over the predicted variables, which all weigh the same."""
     if loss_aux is None:
         return loss_o2
-    if weights is None:
-        return loss_o2 + cfg.aux_loss_weight * loss_aux.mean()
-    return weights[0] * loss_o2 + (weights[1:] * loss_aux).sum()
+    w = 1.0 / (1 + loss_aux.numel())
+    return w * loss_o2 + (w * loss_aux).sum()
 
 
 # --------------------------------------------------------------------------------------- evaluator
@@ -406,15 +390,14 @@ class Evaluator:
         a, b = np.triu_indices(nv, 1)
         pairs[..., a, b] = pairs[..., b, a] = self.coh_pairs.cpu().numpy()
         out["coh_variables"] = pairs
-        out["objective"] = np.asarray(objective(self.cfg, out))
+        out["objective"] = np.asarray(objective(out))
         return out
 
 
 # --------------------------------------------------------------------------------------- summaries
-def objective(cfg, r) -> float:
-    """What selects best.pt (standardised units): the weighted mean loss over variables ("equal"), else the O2 loss."""
-    w = loss_weights(cfg, [str(n) for n in r["variables"]])
-    return float(r["v_loss"][0]) if w is None else float((w * r["v_loss"]).sum())
+def objective(r) -> float:
+    """What selects best.pt: the mean loss of the variables (standardised units)."""
+    return float(np.mean(r["v_loss"]))
 
 
 def pooled(values: np.ndarray, count: np.ndarray, axis=None) -> np.ndarray:

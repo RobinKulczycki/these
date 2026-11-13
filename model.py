@@ -92,26 +92,23 @@ class NoiseConditionedLayerNorm(nn.Module):
 
 
 class MemberDropout(nn.Module):
-    """Dropout with one mask per profile shared by its members in training (members on consecutive rows);
-    off at evaluation, or independent per member with epistemic=True."""
+    """Dropout with one mask per profile, shared by its members (on consecutive rows); off at evaluation."""
 
-    def __init__(self, p: float, epistemic: bool = False):
+    def __init__(self, p: float):
         super().__init__()
-        self.p, self.epistemic = float(p), bool(epistemic)
+        self.p = float(p)
 
     def forward(self, x: torch.Tensor, members: int) -> torch.Tensor:
-        if self.p <= 0.0:
+        if self.p <= 0.0 or not self.training:
             return x
-        if self.training:
-            keep = torch.rand((x.shape[0] // members,) + tuple(x.shape[1:]), device=x.device) >= self.p
-            return x * (keep.to(x.dtype).repeat_interleave(members, dim=0) / (1.0 - self.p))
-        return F.dropout(x, self.p, training=True) if self.epistemic else x
+        keep = torch.rand((x.shape[0] // members,) + tuple(x.shape[1:]), device=x.device) >= self.p
+        return x * (keep.to(x.dtype).repeat_interleave(members, dim=0) / (1.0 - self.p))
 
 
 class FGNBlock(nn.Module):
     """Pre-LN block: self-attention, cross-attention (decoder), MLP; every norm noise-conditioned."""
 
-    def __init__(self, d_model, n_heads, d_ff, dropout, noise_dim, cross, epistemic):
+    def __init__(self, d_model, n_heads, d_ff, dropout, noise_dim, cross):
         super().__init__()
         self.norm_self = NoiseConditionedLayerNorm(d_model, noise_dim)
         self.self_attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
@@ -122,7 +119,7 @@ class FGNBlock(nn.Module):
         self.norm_ff = NoiseConditionedLayerNorm(d_model, noise_dim)
         self.ff_in = nn.Linear(d_model, d_ff)
         self.ff_out = nn.Linear(d_ff, d_model)
-        self.drop = MemberDropout(dropout, epistemic)
+        self.drop = MemberDropout(dropout)
 
     def forward(self, h, z, pad, members, memory=None, memory_pad=None):
         a = self.norm_self(h, z)
@@ -140,7 +137,7 @@ class _FGNBase(nn.Module):
 
     def __init__(self, n_features, n_context, depth_levels, d_model=192, n_heads=8, n_enc_layers=4, n_dec_layers=4,
                  d_ff=768, dropout=0.1, n_depth_freqs=16, depth_min_scale_m=2.0, depth_max_scale_m=4000.0,
-                 lower_bound=None, n_aux=0, noise_dim=32, epistemic_dropout=False, aux_lower_bounds=None):
+                 lower_bound=None, n_aux=0, noise_dim=32, aux_lower_bounds=None):
         super().__init__()
         self.register_buffer("depth", torch.as_tensor(np.asarray(depth_levels), dtype=torch.float32))
         self.noise_dim, self.n_aux = int(noise_dim), int(n_aux)
@@ -153,8 +150,7 @@ class _FGNBase(nn.Module):
         self.context_embed = mlp(n_context)
         self.abs_depth = self._enc()
         self.token_type = nn.Embedding(3, d_model)
-        block = dict(d_model=d_model, n_heads=n_heads, d_ff=d_ff, dropout=dropout, noise_dim=noise_dim,
-                     epistemic=epistemic_dropout)
+        block = dict(d_model=d_model, n_heads=n_heads, d_ff=d_ff, dropout=dropout, noise_dim=noise_dim)
         self.encoder = nn.ModuleList([FGNBlock(cross=False, **block) for _ in range(n_enc_layers)])
         self.encoder_norm = NoiseConditionedLayerNorm(d_model, noise_dim)
         self.decoder = nn.ModuleList([FGNBlock(cross=True, **block) for _ in range(n_dec_layers)])
@@ -324,4 +320,4 @@ def build_model(cfg, grid: dict, stats) -> _FGNBase:
                d_ff=cfg.d_ff, dropout=cfg.dropout, n_depth_freqs=cfg.n_depth_freqs,
                depth_min_scale_m=cfg.depth_min_scale_m, depth_max_scale_m=cfg.depth_max_scale_m, lower_bound=lower,
                n_aux=len(aux_feature_indices(cfg, grid)[0]), noise_dim=cfg.fgn_noise_dim,
-               epistemic_dropout=cfg.fgn_epistemic_dropout, aux_lower_bounds=aux_lower_bounds(cfg, grid, stats))
+               aux_lower_bounds=aux_lower_bounds(cfg, grid, stats))

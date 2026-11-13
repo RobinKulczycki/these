@@ -1108,7 +1108,7 @@ def cmd_field(run: str, processed_dir: Optional[str], out: Path, split: str = "v
     save(fig, out, f"field_{var}_{grid['depth'][k]:.0f}m_stations{station_km:g}km" + (f"_noise{noise_km:g}km" if explicit else ""))
 
 
-def cmd_layouts(run: str, processed_dir: Optional[str], out: Path, split: str = "val", steps: Sequence[int] = (0, 3, 6, 9),
+def cmd_layouts(run: str, processed_dir: Optional[str], out: Path, split: str = "val", steps: Optional[Sequence[int]] = None,
                 every: Sequence[int] = (5, 10, 15), coastal_weight: float = 0.05, coastal_m: float = 200.0,
                 var: str = "o2", depth_m: float = 50.0, n_members: int = 19) -> None:
     """"neighbours": does it matter where the given profiles are? Whole maps are reconstructed from stations on a
@@ -1116,6 +1116,7 @@ def cmd_layouts(run: str, processed_dir: Optional[str], out: Path, split: str = 
     column (bottom shallower than coastal_m) being coastal_weight times as likely as a deep-sea one.
     Error = CRPS / training std, mean of the variables, on the columns that BOTH layouts reconstruct (a column
     further than neighbour_max_km from every station is not reconstructed: see the share of the sea).
+    steps: time steps of the first year of the split (default: four, spread over the year).
     Writes layouts.csv, layouts_error.png and one map figure per N (first time step)."""
     import torch
 
@@ -1131,6 +1132,7 @@ def cmd_layouts(run: str, processed_dir: Optional[str], out: Path, split: str = 
     year = resolve_splits(cfg, load_grid(cfg)["years"])[split][0]
     ds = NeighbourDataset(cfg, grid, stats, [year], train=False, in_memory=False, extras=True)
     coastal = ds.coastal(0, coastal_m)
+    steps = steps or [int(t) for t in np.linspace(0, ds.n_steps(0), 4, endpoint=False)]
     k = int(np.argmin(np.abs(np.asarray(grid["depth"]) - depth_m)))
     noise = torch.randn(n_members, model.noise_dim, generator=torch.Generator().manual_seed(cfg.seed)).to(device)
     layouts = ("grid", "argo")
@@ -1319,7 +1321,8 @@ def main() -> None:
         s.add_argument("--row", type=float, default=None,
                        help="ensemble: D_input or spacing (default 50 / 20 m); neighbours: number of casts")
         s.add_argument("--processed-dir", default=None)
-        s.add_argument("--step", type=int, default=0, help="field: index of the day (or month) in the first year of the split")
+        s.add_argument("--step", type=int, default=0,
+                       help="field: index of the time step (day or month) in the first year of the split")
         s.add_argument("--station-km", type=float, default=60.0, help="field: distance between the stations")
         s.add_argument("--var", default="o2", help="field: variable shown")
         s.add_argument("--depth", type=float, default=50.0, help="field: depth shown (m)")
@@ -1327,7 +1330,8 @@ def main() -> None:
                        help="field: distance over which a member's noise varies (default neighbour_max_km; 0 = one "
                             "draw for the whole sea)")
         s.add_argument("--every", type=int, nargs="*", default=[5, 10, 15], help="layouts: one station in N grid points")
-        s.add_argument("--steps", type=int, nargs="*", default=[0, 3, 6, 9], help="layouts: time steps of the year")
+        s.add_argument("--steps", type=int, nargs="*", default=None,
+                       help="layouts: time steps (days or months) of the year (default: four, spread over the year)")
         s.add_argument("--coastal-weight", type=float, default=0.05,
                        help="layouts: chance of an Argo-like station in a coastal column, relative to a deep-sea one")
         s.add_argument("--coastal-depth", type=float, default=200.0, help="layouts: coastal = bottom shallower (m)")

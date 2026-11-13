@@ -37,6 +37,8 @@ SPLIT=test bash analyse.sh v4_cutoff v4_sparse v4_nb   # the test years: once, a
 `casts/`, `layouts/` and `field/` (see the head of the script). `--eval-only` scores the validation years unless
 `--split test` is given. `$B` in `~/tfec/env.sh` still says `input_drift_mode=basin`, which no longer exists: the
 later `input_drift_mode=` overrides it, or remove it from `B`. W&B runs offline: `wandb sync <run>/wandb/offline-run-*`.
+`~/tfec/env.sh` must define `D` (processed data), `R` (runs) and `B`; load it in every new terminal
+(`. ~/tfec/env.sh`) before a command that contains `$D`, `$R` or `$B`. The scripts load it themselves.
 
 Several `neighbours` set-ups: train one run per set-up with the SAME `neighbour_val_km` (a row beyond a run's
 `neighbour_max_km` stays empty), then compare up to three of them on the same rows:

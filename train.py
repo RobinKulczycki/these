@@ -34,7 +34,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from config import FROZEN_ON_RESUME, Config, apply_overrides, config_from_checkpoint
 from dataset import (DRIFT_MODES, cutoff_levels, drift_indices, load_grid, load_or_compute_basin_monthly,
                      load_or_compute_stats, make_dataset, max_input_levels, resolve_splits, subtract_shallowest)
-from metrics import (Evaluator, combine_losses, crps_ensemble, ensemble_median, fill_columns, loss_weights,
+from metrics import (Evaluator, combine_losses, crps_ensemble, ensemble_median, fill_columns,
                      mean_member_distance, scalars, summary_line)
 from model import aux_feature_indices, build_model, gather_levels, observation_mask
 
@@ -146,8 +146,8 @@ def check_config(cfg: Config, depth) -> None:
         raise ValueError(f"experiment must be 'cutoff', 'sparse' or 'neighbours', not {cfg.experiment!r}")
     if cfg.input_drift_mode not in DRIFT_MODES:
         raise ValueError(f"input_drift_mode must be one of {DRIFT_MODES}, not {cfg.input_drift_mode!r}")
-    if cfg.fgn_train_members < 2 or cfg.fgn_eval_members < 2 or not 0.0 <= cfg.fgn_crps_alpha <= 1.0:
-        raise ValueError("fgn_train_members and fgn_eval_members must be >= 2, fgn_crps_alpha in [0, 1]")
+    if cfg.fgn_train_members < 2 or cfg.fgn_eval_members < 2:
+        raise ValueError("fgn_train_members and fgn_eval_members must be >= 2")
     if cfg.input_drift_mode == "lagged" and (cfg.drift_window_years < 1 or cfg.drift_lag_years < 0):
         raise ValueError("drift_window_years must be >= 1 and drift_lag_years >= 0")
     if cfg.experiment == "cutoff":
@@ -212,8 +212,6 @@ class Task:
         self.names = [grid["target"]] + aux_names  # every predicted variable, O2 first
         self.feat = torch.as_tensor([self.ti] + aux_feat, dtype=torch.long, device=device)
         self.aux_idx = self.feat[1:] if aux_feat else None
-        lw = loss_weights(cfg, self.names)
-        self.loss_w = None if lw is None else torch.as_tensor(lw, dtype=torch.float32, device=device)
         self.target_std = float(stats["std"][self.ti])
         idx = drift_indices(cfg, grid) if cfg.input_drift_mode == "shallowest" else []
         self.drift_idx = torch.as_tensor(idx, dtype=torch.long, device=device) if idx else None
@@ -250,14 +248,13 @@ class Task:
         return torch.bucketize(km, self.km_edges) == i  # distance bin of the nearest cast (no cast: no row)
 
     def losses(self, pred, aux, x, target_idx, mask):
-        """Half the (almost-)fair CRPS over the real targets: O2 () and every other variable (A,) or None."""
-        alpha = self.cfg.fgn_crps_alpha
+        """Half the fair CRPS over the real targets: O2 () and every other variable (A,) or None."""
         y = torch.gather(x[..., self.ti], 1, target_idx).float()
         n_real = mask.sum().clamp(min=1.0)
-        loss_o2 = (0.5 * crps_ensemble(pred.float(), y, alpha, dim=1) * mask).sum() / n_real
+        loss_o2 = (0.5 * crps_ensemble(pred.float(), y) * mask).sum() / n_real
         if aux is None:
             return loss_o2, None
-        per_feature = 0.5 * crps_ensemble(aux.float(), gather_levels(x, target_idx, self.aux_idx).float(), alpha, dim=1)
+        per_feature = 0.5 * crps_ensemble(aux.float(), gather_levels(x, target_idx, self.aux_idx).float())
         return loss_o2, (per_feature * mask.unsqueeze(-1)).sum(dim=(0, 1)) / n_real
 
 
@@ -312,7 +309,7 @@ def train_one_epoch(model, loader, opt, sched, scaler, cfg: Config, task: Task, 
             pred, target_idx, target_mask, aux = model(*inputs, n_members=cfg.fgn_train_members)
         mask = (target_mask & given[:, None]).float()
         loss_o2, loss_aux = task.losses(pred, aux, x, target_idx, mask)
-        loss = combine_losses(cfg, loss_o2, loss_aux, task.loss_w)
+        loss = combine_losses(loss_o2, loss_aux)
         scaler.scale(loss).backward()
         scaler.unscale_(opt)
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
@@ -489,9 +486,8 @@ def main() -> None:
         if ddp:
             dist.barrier()
     task = Task(cfg, grid, stats, device)
-    log.info("Experiment %s | targets %s | loss weights %s | drift %s on %s", cfg.experiment, task.names,
-             None if task.loss_w is None else [round(w, 3) for w in task.loss_w.tolist()], cfg.input_drift_mode,
-             cfg.input_drift_vars)
+    log.info("Experiment %s | targets %s (equal weights) | drift %s on %s", cfg.experiment, task.names,
+             cfg.input_drift_mode, cfg.input_drift_vars)
 
     train_ds = make_dataset(cfg, grid, stats, splits["train"], True, in_memory=cfg.in_memory)
     val_ds = make_dataset(cfg, grid, stats, splits["val"], False, max_profiles=cfg.val_max_profiles, seed=cfg.seed,

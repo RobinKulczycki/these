@@ -146,10 +146,10 @@ def synthetic(tmp: Path) -> None:
     check(np.isfinite(r["coh_levels"]).all() and (r["coh_levels"][:, 1] > 0).all() and r["coh_variables"].shape[2:] == (9, 9),
           "coherence scores (between levels, between variables)")
     check(any(f.startswith("basin_monthly_") for f in os.listdir(data)), "lagged reference cached")
-    out = train("cut", "experiment=cutoff", "input_drift_mode=lagged", "variable_weighting=o2", epochs=3)
+    out = train("cut", "experiment=cutoff", "input_drift_mode=lagged", "nonnegative_vars=('o2',)", epochs=3)
     ck = torch.load(runs / "cut" / "last.pt", map_location="cpu", weights_only=False)
     check("Resuming from" in out and ck["state"]["epoch"] == 3 and ck["state"]["step"] == 24, "resume: epoch 3, step 24")
-    check(ck["cfg"]["variable_weighting"] == "equal", "resume keeps the loss of the checkpoint")
+    check(len(ck["cfg"]["nonnegative_vars"]) == 3, "resume keeps the output bounds of the checkpoint")
     check(same_metrics(evaluate("cut"), metrics(runs / "cut" / "val_metrics_best.npz")) < 1e-5,
           "--eval-only of best.pt reproduces its validation scores")
     evaluate("cut", "test", 100)
@@ -186,9 +186,8 @@ def synthetic(tmp: Path) -> None:
     train("nb_bad", *nb, "input_drift_mode=shallowest", epochs=1, ok=False)
     check(True, "neighbours + shallowest drift is refused")
 
-    print("no drift, O2-weighted loss, EMA, one variable weighted twice")
-    train("none", "input_drift_mode=none", "variable_weighting=o2", "ema_decay=0.9", epochs=1)
-    train("w2", "input_drift_mode=shallowest", "variable_weights={'o2':2.0}", epochs=1)
+    print("no drift, EMA")
+    train("none", "input_drift_mode=none", "ema_decay=0.9", epochs=1)
     train("bad", "input_drift_mode=basin", epochs=1, ok=False)
     check(True, "input_drift_mode=basin is refused")
 
