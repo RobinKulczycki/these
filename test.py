@@ -214,6 +214,7 @@ def synthetic(tmp: Path) -> None:
     run("figures.py", "maps", f"100 km={runs / 'nb'}", f"70 km={runs / 'nb70'}", "--out", figs / "nb_ranges")
     out = run("figures.py", "field", runs / "nb", "--station-km", 90, "--out", figs / "nb_field")
     run("figures.py", "field", runs / "nb", "--station-km", 90, "--noise-km", 150, "--out", figs / "nb_field")
+    run("figures.py", "field", runs / "nb", "--station-km", 90, "--layout", "argo", "--out", figs / "nb_field")
     line = next(x for x in out.splitlines() if "next to each other" in x)  # real error, members, noise per profile
     c = [float(x) for x in re.findall(r"-?\d+\.\d\d", line.split("):")[1])]
     check(c[1] > 0.5 > abs(c[2]), f"field: members sharing their noise are coherent between profiles ({c[1]:.2f}), "
@@ -226,7 +227,7 @@ def synthetic(tmp: Path) -> None:
         "--set", "train_years=(2000,2001,2002,2003,2004)", "val_years=(2005,)", "test_years=(2006,2007)")
     n = {d.name: len(list(d.rglob("*.png"))) for d in figs.iterdir()}
     check(n["cut"] >= 89 and n["sparse"] >= 85 and n["test_maps"] >= 31 and n["drift"] == 2 and n["nb"] >= 87
-          and n["nb_casts"] >= 52 and n["nb_ranges"] >= 80 and n["nb_field"] == 2 and n["nb_layouts"] == 3,
+          and n["nb_casts"] >= 52 and n["nb_ranges"] >= 80 and n["nb_field"] == 3 and n["nb_layouts"] == 3,
           f"figures written {n}")
     import figures
 

@@ -1044,8 +1044,9 @@ def draw_field(ax, grid: dict, data: np.ndarray, cmap, norm, sea: np.ndarray, st
 
 def cmd_field(run: str, processed_dir: Optional[str], out: Path, split: str = "val", step: int = 0,
               station_km: float = 60.0, var: str = "o2", depth_m: float = 50.0, noise_km: Optional[float] = None,
-              n_members: int = 19) -> None:
-    """"neighbours": one time step mapped from stations about station_km apart. The columns are predicted
+              layout: str = "grid", n_members: int = 19) -> None:
+    """"neighbours": one time step mapped from stations about station_km apart (layout "argo": as many stations,
+    placed like Argo floats: at random, a coastal column 20 times less likely). The columns are predicted
     together: a member gives close columns the same noise, which makes it a coherent map. Its noise varies smoothly
     over noise_km (default neighbour_max_km; 0 = one draw for the whole sea), so columns far apart get different
     draws. The last panel draws the noise per profile instead, as the scores do.
@@ -1062,7 +1063,7 @@ def cmd_field(run: str, processed_dir: Optional[str], out: Path, split: str = "v
         raise SystemExit("figures.py field needs a run of experiment=neighbours")
     year = resolve_splits(cfg, load_grid(cfg)["years"])[split][0]
     ds = NeighbourDataset(cfg, grid, stats, [year], train=False, in_memory=False, extras=True)
-    stations = ds.stations(0, step, tuple(max(1, int(round(station_km / km))) for km in ds.cell_km))
+    stations = ds.stations(0, step, tuple(max(1, int(round(station_km / km))) for km in ds.cell_km), layout)
     b = {k: v.to(device) for k, v in ds.field(0, stations)[0].items()}
     lat_ax, lon_ax = np.asarray(grid["lat"]), np.asarray(grid["lon"])
     iy, ix = (nearest_index(ax, b[k].cpu().numpy().astype(float)) for ax, k in ((lat_ax, "lat"), (lon_ax, "lon")))
@@ -1102,11 +1103,13 @@ def cmd_field(run: str, processed_dir: Optional[str], out: Path, split: str = "v
     for ax, (title, data), (norm, cmap) in zip(axes.flat, panels, scales):
         draw_field(ax, grid, data, cmap, norm, t, ds.position(0, stations), title, UNITS.get(var, ""))
     how = f"noise of a member smooth over {noise_km:g} km" if noise_km else "one noise draw per member for the whole sea"
-    fig.suptitle(f"{level} mapped from stations {station_km:g} km apart (dots); {how}\nCorrelation between two profiles "
+    where = f"{len(stations)} stations placed like Argo floats" if layout == "argo" else f"stations {station_km:g} km apart"
+    fig.suptitle(f"{level} mapped from {where} (dots); {how}\nCorrelation between two profiles "
                  + "; ".join(lines).replace("members with noise drawn per profile", "noise per profile"),
                  x=0.01, ha="left", fontweight="bold", fontsize=11)
     fig.tight_layout()
-    save(fig, out, f"field_{var}_{grid['depth'][k]:.0f}m_stations{station_km:g}km" + (f"_noise{noise_km:g}km" if explicit else ""))
+    save(fig, out, f"field_{var}_{grid['depth'][k]:.0f}m_stations{station_km:g}km" + (f"_noise{noise_km:g}km" if explicit else "")
+         + ("_argo" if layout == "argo" else ""))
 
 
 def cmd_layouts(run: str, processed_dir: Optional[str], out: Path, split: str = "val", steps: Optional[Sequence[int]] = None,
@@ -1324,6 +1327,8 @@ def main() -> None:
         s.add_argument("--step", type=int, default=0,
                        help="field: index of the time step (day or month) in the first year of the split")
         s.add_argument("--station-km", type=float, default=60.0, help="field: distance between the stations")
+        s.add_argument("--layout", default="grid", choices=("grid", "argo"),
+                       help="field: stations on a regular grid, or as many placed like Argo floats")
         s.add_argument("--var", default="o2", help="field: variable shown")
         s.add_argument("--depth", type=float, default=50.0, help="field: depth shown (m)")
         s.add_argument("--noise-km", type=float, default=None,
@@ -1356,7 +1361,8 @@ def main() -> None:
     if a.cmd == "ensemble":
         return cmd_ensemble(str(run_dirs[0]), a.processed_dir, out, a.row, split=a.split)
     if a.cmd == "field":
-        return cmd_field(str(run_dirs[0]), a.processed_dir, out, a.split, a.step, a.station_km, a.var, a.depth, a.noise_km)
+        return cmd_field(str(run_dirs[0]), a.processed_dir, out, a.split, a.step, a.station_km, a.var, a.depth, a.noise_km,
+                         a.layout)
     if a.cmd == "layouts":
         return cmd_layouts(str(run_dirs[0]), a.processed_dir, out, a.split, a.steps, a.every, a.coastal_weight,
                            a.coastal_depth, a.var, a.depth)

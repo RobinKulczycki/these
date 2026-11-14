@@ -110,7 +110,7 @@ draws 1..`neighbour_casts`. A sample has up to 5x the tokens of a cutoff one: lo
 of memory. Drift: `none` or `lagged`.
 
 ```bash
-python figures.py field $R/v5_nb --out figs/v5_nb --station-km 60 --var o2 --depth 50 [--step 6] [--noise-km 80]
+python figures.py field $R/v5_nb --out figs/v5_nb --station-km 60 --var o2 --depth 50 [--step 6] [--noise-km 80] [--layout argo]
 python figures.py layouts $R/v5_nb --out figs/v5_nb/layouts --every 5 10 15 [--steps 0 3 6 9] [--coastal-weight 0.05]
 ```
 `layouts`: real floats are not on a grid, and there are almost none in the coastal area (CMEMS-BLK-QUID-007-010,

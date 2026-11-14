@@ -7,7 +7,7 @@
 #   casts/    evaluated with exactly 1, 2 and 4 given columns
 #   layouts/  maps from stations on a grid against Argo-like stations, one station in 3, 5, 10, 15, 20 grid points
 #   field/    maps from stations 30, 60 and 120 km apart, and (60 km) with a member's noise smooth over 10, 15, 25,
-#             50 km or one draw for the whole sea
+#             50 km or one draw for the whole sea; each one also from as many stations placed like Argo floats
 CODE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$CODE/cluster.sh"
 cd "$CODE" && mkdir -p logs
@@ -38,7 +38,7 @@ for NAME in "$@"; do
       "--dependency=afterok$ids" > /dev/null
     job "layouts_$TAG" "python figures.py layouts $RUN --out $OUT/layouts $figures --every 3 5 10 15 20" > /dev/null
     field="python figures.py field $RUN --out $OUT/field $figures"
-    job "field_$TAG" "for km in 30 60 120; do $field --station-km \$km; done; for km in 0 10 15 25 50; do $field --station-km 60 --noise-km \$km; done" > /dev/null
+    job "field_$TAG" "for layout in grid argo; do for km in 30 60 120; do $field --layout \$layout --station-km \$km; done; for km in 0 10 15 25 50; do $field --layout \$layout --station-km 60 --noise-km \$km; done; done" > /dev/null
   fi
   echo "$NAME ($SPLIT): jobs submitted -> $CODE/$OUT"
 done
