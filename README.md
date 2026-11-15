@@ -66,7 +66,8 @@ drift_window_years + 1, Y - drift_lag_years]; the default of `cutoff` and `neigh
 | Do the members hang together? | `compare/coherence`, `ensemble_all_variables` + `ensemble_coherence.csv`, `field_*` (`neighbours`) |
 | `neighbours`: 1, 2 or 4 given columns? | `casts/` |
 | `neighbours`: stations on a grid or placed like Argo floats, and how many? | `layouts/`: `layouts_error`, `layouts_map_1inN`, `layouts.csv` |
-| `neighbours`: maps, how far apart the stations are, coherence between columns | `field/`: `field_<variable>_<depth>m_stations<km>km[_noise<km>km]` |
+| `neighbours`: how good is a map against the number of Argo-like floats? | `figures.py floats`: `floats_error`, `floats_variables`, `floats_maps`, `floats.csv` |
+| `neighbours`: maps, how far apart the stations are, coherence between columns | `field/`: `field_<variable>_<depth>m_stations<km>km[_noise<km>km][_argo]` |
 | The data itself | `data/`, `drift/` |
 
 Every `compare` / `maps` figure takes 1-3 runs of the same experiment:
@@ -112,6 +113,12 @@ of memory. Drift: `none` or `lagged`.
 ```bash
 python figures.py field $R/v5_nb --out figs/v5_nb --station-km 60 --var o2 --depth 50 [--step 6] [--noise-km 80] [--layout argo]
 python figures.py layouts $R/v5_nb --out figs/v5_nb/layouts --every 5 10 15 [--steps 0 3 6 9] [--coastal-weight 0.05]
+```
+`floats` (1-3 runs, e.g. three ranges): maps reconstructed from 10, 20 ... 500 floats placed like Argo floats, anew on
+each of 8 days of the year: share of the sea reconstructed and error (mean of the variables per region, and every
+variable) against the number of floats:
+```bash
+python figures.py floats "50 km=$R/v5_nb_50" "100 km=$R/v5_nb" "200 km=$R/v5_nb_200" --out figs/floats [--numbers 10 20 50] [--days 8]
 ```
 `layouts`: real floats are not on a grid, and there are almost none in the coastal area (CMEMS-BLK-QUID-007-010,
 Fig. 1). Whole maps (snapshots: the stations do not move) are reconstructed from stations on a regular grid, one

@@ -345,18 +345,20 @@ class NeighbourDataset(ProfileDataset):
         return self.sample(f, j, cand[pick], dx[pick], dy[pick])
 
     def stations(self, f: int, t: int, every: Tuple[int, int], layout: str = "grid", coastal_weight: float = 0.05,
-                 coastal_m: float = 200.0, seed: int = 0) -> np.ndarray:
+                 coastal_m: float = 200.0, seed: int = 0, n: Optional[int] = None) -> np.ndarray:
         """Profiles of time step t of folder f that are given (the stations).
-        "grid": one grid point every `every` (rows, columns). "argo": as many, drawn at random, a coastal column
-        (bottom shallower than coastal_m) being coastal_weight times as likely as a deep-sea one."""
+        "grid": one grid point every `every` (rows, columns). "argo": n stations (default: as many as the grid)
+        drawn at random, a coastal column (bottom shallower than coastal_m) being coastal_weight times as likely as
+        a deep-sea one."""
         tyx = self._tyx[f]
         here = np.nonzero(tyx[:, 0] == min(t, int(tyx[:, 0].max())))[0]
         grid = here[(tyx[here, 1] % every[0] == 0) & (tyx[here, 2] % every[1] == 0)]
         if layout == "grid":
             return grid
+        n = len(grid) if n is None else min(int(n), len(here))
         weight = np.where(self.coastal(f, coastal_m)[here], coastal_weight, 1.0)
-        rng = np.random.default_rng((self.seed, seed, t, len(grid)))
-        return np.sort(rng.choice(here, size=len(grid), replace=False, p=weight / weight.sum()))
+        rng = np.random.default_rng((self.seed, seed, t, n))
+        return np.sort(rng.choice(here, size=n, replace=False, p=weight / weight.sum()))
 
     def n_steps(self, f: int) -> int:
         """Number of time steps (days or months) of folder f."""

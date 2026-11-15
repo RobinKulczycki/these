@@ -220,6 +220,12 @@ def synthetic(tmp: Path) -> None:
     check(c[1] > 0.5 > abs(c[2]), f"field: members sharing their noise are coherent between profiles ({c[1]:.2f}), "
                                   f"members with their own noise are not ({c[2]:.2f})")
     run("figures.py", "layouts", runs / "nb", "--every", 2, 3, "--steps", 0, 6, "--out", figs / "nb_layouts")
+    run("figures.py", "floats", f"100 km={runs / 'nb'}", f"70 km={runs / 'nb70'}", "--numbers", 5, 10, 30, "--days", 2,
+        "--out", figs / "nb_floats")
+    table = (figs / "nb_floats" / "floats.csv").read_text().splitlines()
+    cover = [float(x.split(",")[2]) for x in table[1:]]
+    check(len(table) == 7 and cover[0] < cover[1] < cover[2] and cover[3] < cover[0],
+          "floats: more floats, or a longer range, reconstruct more of the sea")
     table = (figs / "nb_layouts" / "layouts.csv").read_text().splitlines()
     check(len(table) == 5 and table[1].split(",")[2] == table[2].split(",")[2],
           "layouts: grid and Argo-like stations, the same number of each")
@@ -227,7 +233,7 @@ def synthetic(tmp: Path) -> None:
         "--set", "train_years=(2000,2001,2002,2003,2004)", "val_years=(2005,)", "test_years=(2006,2007)")
     n = {d.name: len(list(d.rglob("*.png"))) for d in figs.iterdir()}
     check(n["cut"] >= 89 and n["sparse"] >= 85 and n["test_maps"] >= 31 and n["drift"] == 2 and n["nb"] >= 87
-          and n["nb_casts"] >= 52 and n["nb_ranges"] >= 80 and n["nb_field"] == 3 and n["nb_layouts"] == 3,
+          and n["nb_casts"] >= 52 and n["nb_ranges"] >= 80 and n["nb_field"] == 3 and n["nb_layouts"] == 3 and n["nb_floats"] == 3,
           f"figures written {n}")
     import figures
 
