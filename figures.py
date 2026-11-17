@@ -150,7 +150,7 @@ def row_ticks(m) -> List[str]:
     rows = [float(r) for r in m["rows"]]
     if "nearest cast" in str(m["row_name"]):
         return [f"{a:g}-{b:g}" for a, b in zip([0.0] + rows[:-1], rows)]
-    return [f"{r:g}" for r in rows]
+    return [f"{r:.0f}" for r in rows]  # D_input is a model level (4.5367 m): whole metres are readable
 
 
 def row_text(m, i: int) -> str:
