@@ -8,8 +8,12 @@ Figures from the metrics files (<run>/val_metrics_best.npz, <run>/<split>_metric
             oxycline, summary.csv
             time:        bias and CRPS per month of the record, per calendar month (also per water-mass layer) and
                          per calendar month x depth
-            calibration: rank histogram
-            coherence:   what the coherence of the members is worth, between levels and between variables
+            calibration: rank histogram, coverage against the variability of every variable per depth
+            coherence:   what the coherence of the members is worth, between levels and between variables, and
+                         the variogram score (vertical coherence)
+            per depth:   CRPS / std of the truth at that depth; CRPS = accuracy - spread term, deep sea and shelf
+            baselines:   climatology (mean of the training years at that place and level) and the same-month
+                         climatology, scored on the same points, dashed (and IDW for "neighbours")
   maps      error maps of every variable per water-mass layer and per season, the oxycline, and the difference with
             another run
   ensemble  members of every variable for a few casts of one run (the same member keeps its colour in every
@@ -17,6 +21,8 @@ Figures from the metrics files (<run>/val_metrics_best.npz, <run>/<split>_metric
   field     "neighbours" only: a whole map predicted from a few stations, with members coherent between profiles
   layouts   "neighbours" only: maps reconstructed from stations on a regular grid against as many stations placed
             like Argo floats (at random, mostly in the deep sea), for several numbers of stations
+  snapshot  cutoff / sparse: every column of one day reconstructed, mapped at a few depths (truth, reconstruction,
+            error, spread)
   floats    "neighbours" only, 1-3 runs: how good the reconstructed maps are against the number of floats placed
             like Argo floats (share of the sea reconstructed, error per region and per variable, example maps)
   drift     data only: how the column drifts between years and the bias each drift reference leaves
@@ -46,9 +52,10 @@ from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm  # noqa: E40
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from config import Config  # noqa: E402
-from metrics import LONG_NAMES, SHORT_NAMES, UNITS, coherence, layer_labels, pooled  # noqa: E402
+from metrics import LONG_NAMES, SHELF_M, SHORT_NAMES, UNITS, coherence, layer_labels, pooled  # noqa: E402
 
-SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100"]
+SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#8f5ad6", "#52514e"]
+BASELINES = {"idw": "IDW", "climmonth": "climatology (same month)", "clim": "climatology"}  # <metrics file>_<key>.npz
 VAR_COLORS = ["#0b0b0b", "#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#8f5ad6", "#d6457a", "#7a6a4f", "#4fa3a8"]
 INK, INK2, MUTED, GRID, SURFACE, NODATA = "#0b0b0b", "#52514e", "#8a8984", "#e6e5e1", "#fcfcfb", "#d9d8d3"
 SEQ = LinearSegmentedColormap.from_list("seq", ["#cde2fb", "#86b6ef", "#3987e5", "#1c5cab", "#0d366b"])
@@ -118,8 +125,13 @@ def coords(m) -> List[str]:
 
 
 def is_ensemble(m) -> bool:
-    """False for the one-member baseline (IDW), which has no coverage, spread, rank or coherence."""
+    """False for the one-member baselines (IDW, climatologies), which have no coverage, spread, rank or coherence."""
     return int(m["n_members"]) > 1
+
+
+def line_style(m) -> dict:
+    """Baselines are drawn dashed."""
+    return {} if is_ensemble(m) else {"ls": "--"}
 
 
 def pooled_rows(m, prefix: str, metric: str, v: int, rows=None):
@@ -209,7 +221,7 @@ def norm_for(metric: str, data: np.ndarray, m):
                             vmax=1.0), DIV.reversed(), data
     lo = float(np.percentile(finite, 2)) if finite.size else 0.0
     hi = float(np.percentile(finite, 98)) if finite.size else 1.0
-    return plt.Normalize(min(lo, 0.0) if metric in ("crps", "mae") else lo, max(hi, lo + 1e-9)), SEQ, data
+    return plt.Normalize(min(lo, 0.0) if metric in ("crps", "mae") else lo, max(hi, lo + 1e-9)), SEQ, data  # "value": as is
 
 
 # --------------------------------------------------------------------------------------- per-variable figures
@@ -225,7 +237,7 @@ def fig_profiles(runs: Runs, coord: str, metric: str, rows=None, max_depth: floa
                 y, _, prefix, _ = vertical(m, coord)
                 val, n = pooled_rows(m, prefix, metric, names(m).index(name), rows)
                 ok = (n > 0) & np.isfinite(val)
-                ax.plot(val[ok], y[ok], color=color, label=label)
+                ax.plot(val[ok], y[ok], color=color, label=label, **line_style(m))
         ref_line(ax, metric, m0)
         ax.set_title(LONG_NAMES.get(name, name))
         u = unit(m0, v, metric)
@@ -265,7 +277,7 @@ def fig_by_row(runs: Runs, metric: str = "crps"):
         for (label, m), color in zip(runs, SERIES):
             if name in names(m):
                 ax.plot(np.arange(len(rows)), pooled_vertical(m, metric, names(m).index(name)), color=color, marker="o",
-                        ms=4, label=label)
+                        ms=4, label=label, **line_style(m))
         u = unit(m0, v, metric)
         ax.set_title(LONG_NAMES.get(name, name) + (f" ({u})" if u else ""), fontsize=11)
         ax.set_xticks(np.arange(len(rows)))
@@ -321,7 +333,7 @@ def fig_rows(runs: Runs, v: int, coord: str, metric: str = "crps", rows_sel=None
             val = np.where(m[prefix + "count"][v][r] > 0, m[prefix + metric][v][r], np.nan)
             if coord == "depth" and "observed" in m:  # sparse: observed levels are known exactly
                 val = np.where(m["observed"][r], 0.0, val)
-            ax.plot(val, y, color=color, label=label)
+            ax.plot(val, y, color=color, label=label, **line_style(m))
         if coord == "depth" and "observed" in m0:
             ax.plot(np.zeros(int(m0["observed"][r].sum())), m0["level_depths"][m0["observed"][r]], "o", color=INK, ms=3)
         elif coord == "depth" and str(m0["experiment"]) == "cutoff":
@@ -368,7 +380,7 @@ def fig_time(runs: Runs, metric: str = "bias", layers=None):
             with np.errstate(invalid="ignore", divide="ignore"):
                 val = np.where(n > 0, s / n * float(m["var_std"][vi]) * (2.0 if metric == "crps" else 1.0), np.nan)
             t = 1970 + m["t_months"] / 12.0 + 1 / 24.0
-            ax.plot(t, val, color=color, marker="o", ms=2.5, lw=1.4, label=label)
+            ax.plot(t, val, color=color, marker="o", ms=2.5, lw=1.4, label=label, **line_style(m))
         if metric == "bias":
             ax.axhline(0, color=INK2, lw=0.8)
         y0, y1 = int(np.floor(t.min())), int(np.ceil(t.max()))
@@ -410,7 +422,7 @@ def fig_season(runs: Runs, metric: str = "crps", by_layer: bool = False):
             for (label, m), color in zip(runs, SERIES):
                 if name in names(m):
                     ax.plot(np.arange(12), calendar_months(m, names(m).index(name), metric), color=color, marker="o", ms=3,
-                            label=label)
+                            label=label, **line_style(m))
         if metric == "bias":
             ax.axhline(0, color=INK2, lw=0.8)
         else:
@@ -519,6 +531,131 @@ def fig_coherence(runs: Runs):
     return fig
 
 
+def truth_std(m, view: str, v: int, sel=slice(None)):
+    """Standard deviation of the truth of variable v at every level (physical units), over the scored points of the
+    selected rows (view "v") or regions (view "z", 0 = deep sea, 1 = shelf) -> (std, number of points)."""
+    n, s1, s2 = (m[f"{view}_{k}"][v][sel].astype(np.float64) for k in ("count", "y", "y2"))
+    if n.ndim == 2:
+        n, s1, s2 = n.sum(0), s1.sum(0), s2.sum(0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.sqrt(np.clip(s2 / n - (s1 / n) ** 2, 0, None)) * float(m["var_std"][v]), n
+
+
+LOCAL_MIN = 0.02  # a level is left out of "CRPS / std at its depth" where the truth barely varies (e.g. O2 = 0)
+
+
+def local_relative(m, v: int):
+    """CRPS of variable v at every level divided by the variability of the truth at that level (rows pooled), NaN
+    where the truth varies by less than LOCAL_MIN of its overall std -> (values, number of points)."""
+    crps, n = pooled_rows(m, "v_", "crps", v)
+    std, _ = truth_std(m, "v", v)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where((std > LOCAL_MIN * float(m["var_std"][v])) & (n >= 50), crps / std, np.nan), n
+
+
+def fig_local_relative(m, max_depth: float = 300.0):
+    """CRPS / std of the truth AT EACH DEPTH (not over the whole column): the error relative to how much the variable
+    varies at that depth."""
+    fig, ax = plt.subplots(figsize=(6.8, 6.4))
+    y = np.asarray(m["level_depths"], dtype=np.float64)
+    for v, name in enumerate(names(m)):
+        val, _ = local_relative(m, v)
+        ax.plot(val, y, color=VAR_COLORS[v % len(VAR_COLORS)], lw=2.4 if v == 0 else 1.5, label=LONG_NAMES.get(name, name))
+    ax.set_ylim(*reversed(vlim(m, "depth", max_depth)))
+    ax.set_xlim(left=0)
+    ax.set(xlabel="CRPS / standard deviation of the truth at that depth", ylabel="depth (m)",
+           title="Error relative to the variability at each depth")
+    ax.legend(fontsize=9, loc="lower right")
+    fig.text(0.01, 0.005, f"Levels where the truth varies by less than {LOCAL_MIN:.0%} of its overall std are left out.",
+             fontsize=8, color=INK2)
+    fig.tight_layout(rect=(0, 0.02, 1, 1))
+    return fig
+
+
+def fig_variability(m, max_depth: float = 300.0):
+    """How much every variable varies at each depth (std of the truth / its overall std, left) next to the coverage
+    of the member range (right): are the variables with narrow error bars the ones that vary little?"""
+    fig, (ax, ax2) = plt.subplots(1, 2, figsize=(12.5, 6.2), sharey=True)
+    y = np.asarray(m["level_depths"], dtype=np.float64)
+    for v, name in enumerate(names(m)):
+        kw = dict(color=VAR_COLORS[v % len(VAR_COLORS)], lw=2.4 if name in ("chl", "po4") else 1.3,
+                  label=LONG_NAMES.get(name, name))
+        std, n = truth_std(m, "v", v)
+        ok = n >= 50
+        ax.plot(np.where(ok, std / float(m["var_std"][v]), np.nan), y, **kw)
+        cov, n2 = pooled_rows(m, "v_", "coverage", v)
+        ax2.plot(np.where(n2 >= 50, cov, np.nan), y, **kw)
+    ref_line(ax2, "coverage", m)
+    ax.set_ylim(*reversed(vlim(m, "depth", max_depth)))
+    ax.set(xlabel="std of the truth at that depth / overall std", ylabel="depth (m)", title="Variability per depth")
+    ax2.set(xlabel="coverage of the member range (dashed: expected)", title="Coverage per depth")
+    ax.set_xlim(left=0)
+    ax.legend(fontsize=9, loc="lower right")
+    fig.suptitle("Chlorophyll and phosphate (thick) against the other variables", x=0.01, ha="left", fontweight="bold",
+                 fontsize=13)
+    fig.tight_layout()
+    return fig
+
+
+def fig_terms(m, max_depth: float = 300.0):
+    """CRPS = accuracy - spread term, per depth, deep sea and shelf apart. accuracy = mean distance of the members to
+    the truth; spread term = half the mean distance between two members. A high CRPS with a small spread term is
+    overconfidence; with a large one, the members are spread but far from the truth."""
+    fig, axes = subplots(len(names(m)), 3.4, 3.8, sharey=True)
+    y = np.asarray(m["level_depths"], dtype=np.float64)
+    regions = (("deep sea", SERIES[0]), (f"shelf (bottom < {SHELF_M:.0f} m)", SERIES[1]))
+    for v, name in enumerate(names(m)):
+        ax = axes.flat[v]
+        for r, (lab, color) in enumerate(regions):
+            ok = m["z_count"][v][r] >= 50
+            for key, kw in (("crps", dict(lw=2.2)), ("accuracy", dict(lw=1.0)), ("spread_term", dict(lw=1.0, ls="--"))):
+                term = {"crps": "CRPS", "accuracy": "accuracy", "spread_term": "spread term"}[key]
+                ax.plot(np.where(ok, m[f"z_{key}"][v][r], np.nan), y, color=color, label=f"{lab}: {term}", **kw)
+        ax.set_title(LONG_NAMES.get(name, name))
+        u = unit(m, v)
+        ax.set_xlabel(u, fontsize=9)
+        ax.set_xlim(left=0)
+    axes[0, 0].set_ylim(*reversed(vlim(m, "depth", max_depth)))
+    for row in axes:
+        row[0].set_ylabel("depth (m)", fontsize=9)
+    finish(fig, axes, "CRPS = accuracy (mean distance to the truth) - spread term (half the distance between members)", True)
+    return fig
+
+
+def fig_variogram(runs: Runs):
+    """Vertical coherence with the variogram score (p = 0.5, pairs of predicted levels up to 5 apart). Left: how much
+    better than the same members shuffled between levels (1 - score / shuffled score; 0 = no vertical coherence).
+    Right: the score per profile, every run and baseline (lower is better)."""
+    runs = [(label, m) for label, m in runs if "vario" in m]
+    m0 = runs[0][1]
+    nv = len(names(m0))
+    fig, (ax, ax2) = plt.subplots(1, 2, figsize=(13.5, 5.0))
+    ens = [(label, m) for label, m in runs if is_ensemble(m)]
+    width = 0.8 / max(len(ens), 1)
+    for i, ((label, m), color) in enumerate(zip(ens, SERIES)):
+        s = m["vario"].sum(axis=0)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            val = 1.0 - s[0] / s[1]
+        ax.bar(np.arange(nv) + (i - (len(ens) - 1) / 2) * width, val, width * 0.92, color=color, label=label)
+    ax.axhline(0, color=INK2, lw=0.8)
+    ax.set(ylabel="1 - variogram score / score of shuffled members", title="Vertical coherence: better than shuffled")
+    width = 0.8 / len(runs)
+    for i, ((label, m), color) in enumerate(zip(runs, SERIES)):
+        per = m["vario"].sum(axis=0)[0] / max(float(m["vario_n"].sum()), 1.0)
+        ax2.bar(np.arange(nv) + (i - (len(runs) - 1) / 2) * width, per, width * 0.92, color=color, label=label,
+                hatch=None if is_ensemble(m) else "//", edgecolor=SURFACE)
+    ax2.set_yscale("log")
+    ax2.set(ylabel="variogram score per profile (standardised units, lower = better)", title="Variogram score")
+    for a in (ax, ax2):
+        a.set_xticks(np.arange(nv))
+        a.set_xticklabels([SHORT_NAMES.get(n, n) for n in names(m0)])
+        a.legend(fontsize=8)
+    fig.suptitle("Vertical coherence of the profiles (variogram score, Scheuerer and Hamill 2015)", x=0.01, ha="left",
+                 fontweight="bold", fontsize=13)
+    fig.tight_layout()
+    return fig
+
+
 def summary_rows(label: str, m) -> List[list]:
     labs = layer_labels(m["layer_edges"])
     out = []
@@ -531,6 +668,15 @@ def summary_rows(label: str, m) -> List[list]:
         row.append(float(coherence(m["coh_levels"])[v]))
         if not is_ensemble(m):  # a single estimate has no coverage, spread or coherence
             row[6], row[8], row[9] = float("nan"), float("nan"), float("nan")
+        if "v_accuracy" in m:  # CRPS / std at each depth, the two terms of the CRPS, the variogram skill
+            val, n = local_relative(m, v)
+            ok = np.isfinite(val)
+            row.append(float((val[ok] * n[ok]).sum() / n[ok].sum()) if ok.any() else float("nan"))
+            row += [float(pooled(m[f"v_{k}"][v], w)) for k in ("accuracy", "spread_term")]
+            s = m["vario"].sum(axis=0)[:, v]
+            row.append(float(1.0 - s[0] / s[1]) if is_ensemble(m) and s[1] > 0 else float("nan"))
+        else:
+            row += [float("nan")] * 4
         if "density_edges" in m and len(labs) > 1:
             e = m["density_edges"]
             lay = np.searchsorted(m["layer_edges"], 0.5 * (e[1:] + e[:-1]), side="right")
@@ -565,13 +711,24 @@ def cmd_compare(runs: Runs, out: Path, max_depth: float = 300.0) -> None:
         save(fig_season_depth(m0, metric, max_depth), out, f"season_depth_{metric}")
     save(fig_rank(runs), out, "rank_histogram")
     save(fig_coherence(runs), out, "coherence")
+    if "v_accuracy" in m0:  # scores added in this version (older metrics files: re-run train.py --eval-only)
+        save(fig_local_relative(m0, max_depth), out, "crps_over_std_at_depth")
+        save(fig_variability(m0, max_depth), out, "variability_and_coverage_depth")
+        save(fig_terms(m0, max_depth), out, "accuracy_spread_depth")
+        save(fig_variogram(runs), out, "variogram")
     labs = layer_labels(m0["layer_edges"]) if "density_edges" in m0 and len(m0["layer_edges"]) else []
     with open(out / "summary.csv", "w", newline="") as fh:
         wr = csv.writer(fh)
+        refs = {k: dict((r[1], r[3]) for r in summary_rows(lab, m)) for lab, m in runs for k, name in BASELINES.items()
+                if lab == name and k != "idw"}
         wr.writerow(["run", "variable", "unit", "CRPS", "MAE", "bias", "coverage", "CRPS/std", "spread/skill",
-                     "coherence between levels"] + [f"CRPS sigma0 {lab}" for lab in labs])
+                     "coherence between levels", "CRPS/std at its depth", "accuracy", "spread term", "variogram skill"]
+                    + [f"CRPS sigma0 {lab}" for lab in labs]
+                    + [f"skill vs {BASELINES[k]} (1 - CRPS / its CRPS)" for k in refs])
         for label, m in runs:
-            wr.writerows([r[:3] + [f"{x:.4g}" for x in r[3:]] for r in summary_rows(label, m)])
+            for r in summary_rows(label, m):
+                skill = [1.0 - r[3] / refs[k][r[1]] if refs[k].get(r[1]) else float("nan") for k in refs]
+                wr.writerow(r[:3] + [f"{x:.4g}" for x in r[3:] + skill])
     print((out / "summary.csv").read_text())
 
 
@@ -689,11 +846,37 @@ def fig_maps_seasons(m, v: int, min_count: float = 20):
     return fig
 
 
-def cmd_maps(m, out: Path, other=None, rows=None, min_count: float = 20) -> None:
+def fig_maps_state(m, v: int, rows=None, min_count: float = 20):
+    """The truth itself per water-mass layer: its mean (top) and how much it varies (std, bottom) at every location,
+    over the evaluated days: where the state changes, to read the error maps against."""
+    labs = layer_labels(m["layer_edges"])
+    fig, axes = plt.subplots(2, len(labs), figsize=(5.2 * len(labs) + 0.6, 2.8 * 2 + 0.6), squeeze=False)
+    rsel = slice(None) if rows is None else list(rows)
+    std, mean = float(m["var_std"][v]), float(m["var_mean"][v])
+    for i, lab in enumerate(labs):
+        n = m["m_count"][rsel][:, i].sum(axis=0).astype(np.float64)
+        s1, s2 = (m[f"m_{k}"][v][rsel][:, i].sum(axis=0).astype(np.float64) for k in ("y", "y2"))
+        with np.errstate(invalid="ignore", divide="ignore"):
+            mu = np.where(n >= min_count, s1 / n * std + mean, np.nan)
+            sd = np.where(n >= min_count, np.sqrt(np.clip(s2 / n - (s1 / n) ** 2, 0, None)) * std, np.nan)
+        draw_map(axes[0, i], m, mu, "value", f"$\\sigma_0$ {lab}: mean of the truth", unit(m, v), fig)
+        draw_map(axes[1, i], m, sd, "crps", f"$\\sigma_0$ {lab}: std of the truth", unit(m, v), fig)
+    name = names(m)[v]
+    finish(fig, axes, f"{LONG_NAMES.get(name, name)}: the truth per location and water-mass layer (evaluated days)", False)
+    return fig
+
+
+def cmd_maps(m, out: Path, other=None, rows=None, min_count: float = 20, clim=None) -> None:
+    """clim: metrics of the same-month climatology: adds maps_crps_vs_climatology (blue = model better)."""
     for metric in ("crps", "bias", "spread_skill"):
         save(fig_maps(m, metric, rows, min_count=min_count), out, f"maps_{metric}")
     if other is not None:
         save(fig_maps(m, "crps", rows, min_count=min_count, other=other), out, "maps_crps_change")
+    if clim is not None:
+        save(fig_maps(m, "crps", rows, min_count=min_count, other=clim), out, "maps_crps_vs_climatology")
+    if "m_y" in m:
+        for v, name in enumerate(names(m)):
+            save(fig_maps_state(m, v, rows, min_count), out, f"maps_{name}_truth")
     for v, name in enumerate(names(m)):
         save(fig_maps_layers(m, v, rows, min_count), out, f"maps_{name}_layers")
         save(fig_maps_variable(m, v, rows, min_count), out, f"maps_{name}")
@@ -909,8 +1092,9 @@ def physical_coherence(var_names: List[str], truth, members, observed, valid_len
 
 def cmd_ensemble(run: str, processed_dir: Optional[str], out: Path, row: Optional[float] = None, n_casts: int = 3,
                  n_members: int = 50, split: str = "val", max_depth: float = 250.0, show: int = 20) -> None:
-    """Members of every variable for a few profiles (three members keep their colour in every panel: a member is
-    one water column), and ensemble_coherence.csv from 200 profiles (physical_coherence).
+    """Members of every variable for one column of the shelf, of the deep sea west and of the deep sea east, each with
+    its place and date (three members keep their colour in every panel: a member is one water column), and
+    ensemble_coherence.csv from 200 deep profiles (physical_coherence).
     row: D_input / spacing (m), or for "neighbours" the number of casts given (grey; default as in training)."""
     import torch
 
@@ -927,7 +1111,7 @@ def cmd_ensemble(run: str, processed_dir: Optional[str], out: Path, row: Optiona
     else:
         row = row if row is not None else (20.0 if cfg.experiment == "sparse" else 50.0)
         key = float(row) if cfg.experiment == "sparse" else cutoff_levels(depth, [row], 1)[0][0]
-    ds = make_dataset(cfg, grid, stats, resolve_splits(cfg, load_grid(cfg)["years"])[split], False, max_profiles=2000,
+    ds = make_dataset(cfg, grid, stats, resolve_splits(cfg, load_grid(cfg)["years"])[split], False, max_profiles=4000,
                       seed=12345, in_memory=False, extras=True)
     b = torch.utils.data.default_collate([ds[i] for i in range(len(ds))])
     keep = (b["valid_len"] > int(np.searchsorted(depth, max_depth))) & ((b["src_len"] > 0).any(dim=1) if nb else True)
@@ -943,22 +1127,53 @@ def cmd_ensemble(run: str, processed_dir: Optional[str], out: Path, row: Optiona
                                                                    for r in numbers])
         print((out / "ensemble_coherence.csv").read_text())
 
-    pick = np.sort(np.random.default_rng(0).choice(int(keep.sum()), size=min(n_casts, int(keep.sum())), replace=False))
-    b = {k: v[torch.as_tensor(pick, device=device)] for k, v in deep.items()}
+    # one column from each region (shelf, deep sea west, deep sea east), at random among the sampled ones
+    bottom = depth[(b["valid_len"] - 1).clamp(min=0).cpu().numpy()]
+    lon_all, lat_all = b["lon"].cpu().numpy(), b["lat"].cpu().numpy()
+    k_obs = int(key) if cfg.experiment == "cutoff" else 0
+    usable = (b["valid_len"].cpu().numpy() >= k_obs + 4) & (((b["src_len"] > 0).any(dim=1)).cpu().numpy() if nb else True)
+    west = lon_all < 34.5  # about the middle of the basin, between the two gyres
+    regions = [(f"shelf (bottom < {SHELF_M:.0f} m)", usable & (bottom < SHELF_M) & (bottom >= 60)),
+               ("deep sea, west", usable & (bottom >= max_depth) & west), ("deep sea, east", usable & (bottom >= max_depth) & ~west)]
+    rng = np.random.default_rng(0)
+    pick, region_of = [], []
+    for lab, ok in regions[:n_casts]:
+        if ok.any():
+            pick.append(int(rng.choice(np.nonzero(ok)[0])))
+            region_of.append(lab)
+    sample_lat, sample_lon = lat_all, lon_all
+    b = {k: v[torch.as_tensor(pick, device=device)] for k, v in b.items()}
     var_names, truth, members, observed = predict(cfg, grid, stats, model, b, key, n_members)
-    fig, axes = plt.subplots(len(pick), len(var_names), figsize=(2.3 * len(var_names) + 0.6, 2.9 * len(pick) + 1.2),
-                             sharey="row", squeeze=False)
+    fig, axes = plt.subplots(len(pick), len(var_names) + 1, figsize=(2.3 * len(var_names) + 3.4, 2.9 * len(pick) + 1.2),
+                             squeeze=False, gridspec_kw={"width_ratios": [1.5] + [1] * len(var_names)})
+    for c in range(len(pick)):  # where: the column (and its given casts) on the map of the sampled columns
+        ax = axes[c, 0]
+        ax.scatter(sample_lon, sample_lat, s=1, color=NODATA)
+        la, lo = float(b["lat"][c]), float(b["lon"][c])
+        if nb:
+            for s_ in range(b["src_len"].shape[1]):
+                if int(b["src_len"][c, s_]) > 0:
+                    dx, dy = (float(v) for v in b["src_dxy"][c, s_])
+                    cla, clo = la + dy / 111.2, lo + dx / (111.2 * np.cos(np.deg2rad(la)))
+                    ax.plot([lo, clo], [la, cla], color=MUTED, lw=0.8)
+                    ax.plot(clo, cla, "o", color=MUTED, ms=3)
+        ax.plot(lo, la, "*", color=SERIES[1], ms=12, mec=INK, mew=0.5)
+        ax.set_aspect(1.0 / np.cos(np.deg2rad(43.5)))
+        ax.set_xticks([])
+        ax.set_yticks([])
+        when = str(np.datetime64(int(b["time"][c]), getattr(ds, "time_unit", "D")))
+        ax.set_title(f"{region_of[c]}\n{when}, {la:.2f}°N {lo:.2f}°E\nbottom {bottom[pick[c]]:.0f} m", fontsize=9)
     for v, name in enumerate(var_names):
         f = list(grid["features"]).index(name)
         mean, std = float(stats["mean"][f]), float(stats["std"][f])
         for c in range(len(pick)):
-            ax, n = axes[c, v], int(b["valid_len"][c])
+            ax, n = axes[c, v + 1], int(b["valid_len"][c])
             if nb:  # the given casts, down to the bottom of the predicted profile (same drift reference: same day)
                 shift = (b["x_raw"][c, :, f] - b["x"][c, :, f]).cpu().numpy()
-                for s in range(b["src_len"].shape[1]):
-                    ns = min(int(b["src_len"][c, s]), n)
-                    ax.plot((b["src_x"][c, s, :ns, f].cpu().numpy() + shift[:ns]) * std + mean, depth[:ns], color=MUTED,
-                            lw=1.0, label="given casts" if s == 0 else None)
+                for s_ in range(b["src_len"].shape[1]):
+                    ns = min(int(b["src_len"][c, s_]), n)
+                    ax.plot((b["src_x"][c, s_, :ns, f].cpu().numpy() + shift[:ns]) * std + mean, depth[:ns], color=MUTED,
+                            lw=1.0, label="given casts" if s_ == 0 else None)
             for j, mbr in enumerate(members[c, :show, :n, v]):
                 ax.plot(mbr, depth[:n], color=SERIES[0], lw=0.6, alpha=0.4, label="members" if j == 0 else None)
             for j, color in enumerate(MEMBER_COLORS[:members.shape[1]]):
@@ -969,19 +1184,17 @@ def cmd_ensemble(run: str, processed_dir: Optional[str], out: Path, row: Optiona
             o = observed[c, :n]
             ax.plot(truth[c, :n, v][o], depth[:n][o], "o", color=INK, ms=2.5, label="observed" if o.any() else None)
             ax.tick_params(labelsize=8)
+            ax.set_ylim(min(max_depth, float(depth[n - 1]) + 5), 0)
             if c == 0:
                 ax.set_title(LONG_NAMES.get(name, name), fontsize=10)
-    for c in range(len(pick)):
-        axes[c, 0].set_ylim(max_depth, 0)
-        if nb:
-            km = sorted(float(d) for d, n in zip(b["src_dxy"][c].norm(dim=-1).cpu(), b["src_len"][c].cpu()) if n > 0)
-            axes[c, 0].set_ylabel(f"profile {c + 1}: casts at\n{', '.join(f'{d:.0f}' for d in km)} km\ndepth (m)", fontsize=9)
-        else:
-            axes[c, 0].set_ylabel(f"cast {c + 1}\ndepth (m)")
+            if v == 0:
+                ax.set_ylabel("depth (m)", fontsize=9)
+            else:
+                ax.set_yticklabels([])
     what = "" if nb else ("spacing" if cfg.experiment == "sparse" else "D_input") + f" {row:g} m"
-    fig.suptitle("Members of every variable" + (f", {what}" if what else ""), x=0.01, ha="left", fontsize=12,
-                 fontweight="bold")
-    handles, labels = axes[0, 0].get_legend_handles_labels()
+    title = "Members of every variable" + (f", {what}" if what else "") + ("  (star: the column, grey: its given casts)" if nb else "")
+    fig.suptitle(title, x=0.01, ha="left", fontsize=12, fontweight="bold")
+    handles, labels = axes[0, 1].get_legend_handles_labels()
     fig.legend(handles, labels, loc="lower center", ncol=len(labels), bbox_to_anchor=(0.5, 0.0), fontsize=9)
     fig.tight_layout(rect=(0, 0.04, 1, 1))
     save(fig, out, "ensemble_all_variables" + (f"_{int(row)}casts" if nb and row is not None else ""))
@@ -1112,6 +1325,67 @@ def cmd_field(run: str, processed_dir: Optional[str], out: Path, split: str = "v
     fig.tight_layout()
     save(fig, out, f"field_{var}_{grid['depth'][k]:.0f}m_stations{station_km:g}km" + (f"_noise{noise_km:g}km" if explicit else "")
          + ("_argo" if layout == "argo" else ""))
+
+
+def cmd_snapshot(run: str, processed_dir: Optional[str], out: Path, split: str = "val", step: int = 0,
+                 row: Optional[float] = None, depths: Sequence[float] = (30.0, 75.0, 150.0), n_members: int = 19) -> None:
+    """Experiments cutoff and sparse: every column of one day reconstructed, mapped at a few depths: truth,
+    reconstruction (median of the members), reconstruction - truth and spread of the members (std). One figure per
+    variable, snapshot_<variable>_<row>_<date>.png. row: D_input or spacing (m, default 50 / 20). step: index of the day
+    (or month) in the first year of the split. ("neighbours": figures.py field --depth)."""
+    import torch
+
+    from dataset import ProfileDataset, cutoff_levels, load_grid, resolve_splits
+    from train import load_run
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    cfg, grid, stats, model = load_run(Path(run) / "best.pt", [f"processed_dir={processed_dir}"] if processed_dir else [],
+                                       device)
+    if cfg.experiment == "neighbours":
+        raise SystemExit("neighbours: use figures.py field RUN --depth D (maps from stations)")
+    depth = np.asarray(grid["depth"], dtype=np.float64)
+    row = row if row is not None else (20.0 if cfg.experiment == "sparse" else 50.0)
+    key = float(row) if cfg.experiment == "sparse" else cutoff_levels(depth, [row], 1)[0][0]
+    year = resolve_splits(cfg, load_grid(cfg)["years"])[split][0]
+    ds = ProfileDataset(cfg, grid, stats, [year], in_memory=False, extras=True)
+    times = np.unique(ds._times[0])
+    day = times[min(step, len(times) - 1)]
+    cols = np.nonzero(ds._times[0] == day)[0]
+    b = torch.utils.data.default_collate([ds._item(0, int(j)) for j in cols])
+    b = {k: v.to(device) for k, v in b.items()}
+    var_names, truth, members, observed = predict(cfg, grid, stats, model, b, key, n_members)
+    lat, lon, vlen = b["lat"].cpu().numpy(), b["lon"].cpu().numpy(), b["valid_len"].cpu().numpy()
+    sea = on_map(grid, lat, lon, np.ones(len(lat)))
+    when = str(np.datetime64(int(day), ds.time_unit))
+    what = ("spacing" if cfg.experiment == "sparse" else "D_input") + f" {row:g} m"
+    levels = [int(np.argmin(np.abs(depth - d))) for d in depths]
+    for v, name in enumerate(var_names):
+        fig, axes = plt.subplots(len(levels), 4, figsize=(17.5, 3.4 * len(levels) + 0.6), squeeze=False)
+        for r, k in enumerate(levels):
+            here = vlen > k
+            t = on_map(grid, lat[here], lon[here], truth[here, k, v])
+            med = on_map(grid, lat[here], lon[here], np.median(members[here, :, k, v], axis=1))
+            spr = on_map(grid, lat[here], lon[here], members[here, :, k, v].std(axis=1))
+            obs = float(observed[here, k].mean()) if here.any() else 0.0
+            finite = t[np.isfinite(t)]
+            norm = plt.Normalize(*(np.percentile(finite, [2, 98]) if finite.size else (0, 1)))
+            err = med - t
+            lim = max(float(np.nanpercentile(np.abs(err), 98)) if np.isfinite(err).any() else 1e-9, 1e-9)
+            u = UNITS.get(name, "")
+            heads = ("truth", "reconstruction (median)", "reconstruction - truth", "spread (std of the members)")
+            titles = [f"{depth[k]:.0f} m: {h}" if r == 0 else f"{depth[k]:.0f} m" for h in heads]
+            draw_field(axes[r, 0], grid, t, SEQ, norm, sea, None, titles[0], u)
+            draw_field(axes[r, 1], grid, med, SEQ, norm, sea, None, titles[1], u)
+            draw_field(axes[r, 2], grid, err, DIV, TwoSlopeNorm(vmin=-lim, vcenter=0.0, vmax=lim), sea, None, titles[2], u)
+            draw_field(axes[r, 3], grid, spr, SEQ, plt.Normalize(0, max(float(np.nanpercentile(spr, 98)), 1e-9)), sea, None,
+                       titles[3], u)
+            if obs > 0.5:
+                axes[r, 0].set_ylabel(f"{depth[k]:.0f} m is observed\nin most columns", fontsize=9, color=SERIES[1])
+        fig.suptitle(f"{LONG_NAMES.get(name, name)}, every column of {when}, {what} (grey: shallower than the depth)",
+                     x=0.01, ha="left", fontweight="bold", fontsize=12)
+        fig.tight_layout()
+        save(fig, out, f"snapshot_{name}_{row:g}m_{when}")
+    print(f"{len(cols)} columns of {when} -> {out}")
 
 
 def station_maps(run: str, processed_dir: Optional[str], split: str, var: str, depth_m: float, n_members: int = 19):
@@ -1417,7 +1691,7 @@ def cmd_drift(processed_dir: str, out: Path, lagged: Sequence[str], model_runs: 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
-    for name in ("compare", "maps", "ensemble", "field", "layouts", "floats", "all"):
+    for name in ("compare", "maps", "ensemble", "field", "layouts", "floats", "snapshot", "all"):
         s = sub.add_parser(name)
         s.add_argument("runs", nargs="+", help="LABEL=run folder or metrics file (first = reference)")
         s.add_argument("--out", default="figs")
@@ -1435,6 +1709,7 @@ def main() -> None:
                        help="field: stations on a regular grid, or as many placed like Argo floats")
         s.add_argument("--var", default="o2", help="field: variable shown")
         s.add_argument("--depth", type=float, default=50.0, help="field: depth shown (m)")
+        s.add_argument("--depths", type=float, nargs="*", default=[30.0, 75.0, 150.0], help="snapshot: depths shown (m)")
         s.add_argument("--noise-km", type=float, default=None,
                        help="field: distance over which a member's noise varies (default neighbour_max_km; 0 = one "
                             "draw for the whole sea)")
@@ -1469,6 +1744,8 @@ def main() -> None:
     if a.cmd == "field":
         return cmd_field(str(run_dirs[0]), a.processed_dir, out, a.split, a.step, a.station_km, a.var, a.depth, a.noise_km,
                          a.layout)
+    if a.cmd == "snapshot":
+        return cmd_snapshot(str(run_dirs[0]), a.processed_dir, out, a.split, a.step, a.row, a.depths)
     if a.cmd == "floats":
         return cmd_floats(a.runs, a.processed_dir, out, a.split, a.numbers, a.days, a.coastal_weight, a.coastal_depth,
                           a.var, a.depth)
@@ -1477,9 +1754,12 @@ def main() -> None:
                            a.coastal_depth, a.var, a.depth)
     runs = [load(s, a.split) for s in a.runs]
     first = metrics_file(a.runs[0], a.split)
-    idw = first.with_name(first.stem + "_idw.npz")
-    if idw.exists():  # "neighbours": the inverse-distance-weighted mean of the same casts, scored the same way
-        runs.append(load(f"IDW={idw}"))
+    clim = None
+    for key, label in BASELINES.items():  # baselines scored on the same points: <metrics file>_<key>.npz
+        f = first.with_name(f"{first.stem}_{key}.npz")
+        if f.exists():
+            runs.append(load(f"{label}={f}"))
+            clim = runs[-1][1] if key == "climmonth" else clim
     for label, m in runs[1:]:
         if not np.array_equal(m["rows"], runs[0][1]["rows"]):
             raise SystemExit(f"'{label}' is scored on other rows ({m['row_name']}: {m['rows'].tolist()}) than "
@@ -1488,8 +1768,8 @@ def main() -> None:
     if a.cmd in ("compare", "all"):
         cmd_compare(runs, out / "compare" if a.cmd == "all" else out, a.max_depth)
     if a.cmd in ("maps", "all"):
-        cmd_maps(runs[0][1], out / "maps" if a.cmd == "all" else out, runs[1][1] if len(runs) > 1 else None, rows,
-                 a.min_count)
+        other = next((m for lab, m in runs[1:] if lab not in (BASELINES["climmonth"], BASELINES["clim"])), None)
+        cmd_maps(runs[0][1], out / "maps" if a.cmd == "all" else out, other, rows, a.min_count, clim)
     if a.cmd == "all" and (run_dirs[0] / "best.pt").exists():
         cmd_ensemble(str(run_dirs[0]), a.processed_dir, out, a.row, split=a.split)
         if str(runs[0][1]["experiment"]) == "neighbours":

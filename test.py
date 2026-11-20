@@ -153,6 +153,19 @@ def synthetic(tmp: Path) -> None:
     check(same_metrics(evaluate("cut"), metrics(runs / "cut" / "val_metrics_best.npz")) < 1e-5,
           "--eval-only of best.pt reproduces its validation scores")
     evaluate("cut", "test", 100)
+    r = metrics(runs / "cut" / "val_metrics.npz")
+    cm, cl = (metrics(runs / "cut" / f"val_metrics_{k}.npz") for k in ("climmonth", "clim"))
+    ok = r["v_count"] > 0
+    check(np.allclose((r["v_accuracy"] - r["v_spread_term"])[ok], r["v_crps"][ok], rtol=1e-4, atol=1e-6)
+          and np.array_equal(r["z_count"].sum(axis=1), r["v_count"].sum(axis=1)) and np.isfinite(r["vario"]).all()
+          and r["vario_n"].sum() > 0, "CRPS = accuracy - spread term; deep sea + shelf = every point; variogram score")
+    t, c = list(r["variables"]).index("thetao"), list(r["variables"]).index("chl")
+    crps = {k: float(np.where(m["v_count"][t] > 0, m["v_crps"][t] * m["v_count"][t], 0).sum() / m["v_count"][t].sum())
+            for k, m in (("m", cm), ("a", cl))}
+    check(int(cm["n_members"]) == 1 and np.array_equal(cm["v_count"], r["v_count"]) and crps["m"] < crps["a"]
+          and float(np.nanmax(cm["v_crps"][c])) < 1e-4,
+          f"climatologies scored on the same points; the same-month one follows the seasons (T {crps['m']:.3f} against "
+          f"{crps['a']:.3f}); chlorophyll, the same every year, is exact")
 
     print("experiment 2 (sparse), shallowest drift (its default)")
     out = train("sparse", "experiment=sparse")
@@ -206,6 +219,10 @@ def synthetic(tmp: Path) -> None:
     run("figures.py", "all", f"new={runs / 'cut'}", f"other={runs / 'none'}", "--out", figs / "cut")
     run("figures.py", "all", f"sparse={runs / 'sparse'}", f"ddp={runs / 'ddp'}", "--out", figs / "sparse", "--processed-dir", data)
     run("figures.py", "maps", runs / "cut" / "test_metrics.npz", "--rows", "10", "50", "--out", figs / "test_maps")
+    run("figures.py", "snapshot", runs / "cut", "--step", 3, "--depths", 30, 100, "--out", figs / "snapshot")
+    run("figures.py", "snapshot", runs / "sparse", "--out", figs / "snapshot")
+    run("figures.py", "snapshot", runs / "nb", "--out", figs / "snapshot", ok=False)
+    check(len(list((figs / "snapshot").glob("*.png"))) == 18, "snapshot: one map per variable and day (cutoff, sparse)")
     run("figures.py", "all", f"model={runs / 'nb'}", "--out", figs / "nb")
     run("figures.py", "compare", f"1 cast={runs / 'nb' / 'val_metrics_1cast.npz'}", f"1-4 casts={runs / 'nb'}",
         "--out", figs / "nb_casts")
@@ -232,8 +249,8 @@ def synthetic(tmp: Path) -> None:
     run("figures.py", "drift", "--processed-dir", data, "--out", figs / "drift", "--runs", f"cut={runs / 'cut'}",
         "--set", "train_years=(2000,2001,2002,2003,2004)", "val_years=(2005,)", "test_years=(2006,2007)")
     n = {d.name: len(list(d.rglob("*.png"))) for d in figs.iterdir()}
-    check(n["cut"] >= 89 and n["sparse"] >= 85 and n["test_maps"] >= 31 and n["drift"] == 2 and n["nb"] >= 87
-          and n["nb_casts"] >= 52 and n["nb_ranges"] >= 80 and n["nb_field"] == 3 and n["nb_layouts"] == 3 and n["nb_floats"] == 3,
+    check(n["cut"] >= 103 and n["sparse"] >= 99 and n["test_maps"] >= 41 and n["drift"] == 2 and n["nb"] >= 101
+          and n["nb_casts"] >= 56 and n["nb_ranges"] >= 94 and n["nb_field"] == 3 and n["nb_layouts"] == 3 and n["nb_floats"] == 3,
           f"figures written {n}")
     import figures
 

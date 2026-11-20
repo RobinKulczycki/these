@@ -140,6 +140,61 @@ def lagged_reference(bm: Dict[str, np.ndarray], year: int, lag: int, window: int
     return np.where(np.isfinite(per_month), per_month, all_months[None])
 
 
+# --------------------------------------------------------------------------------------- climatology
+def _climatology_path(cfg: Config, grid: dict, years: Sequence[int]) -> Path:
+    key = json.dumps({"years": sorted(map(int, years)), "features": grid["features"], "depth": grid["depth"],
+                      "lat": len(grid["lat"]), "lon": len(grid["lon"])}, sort_keys=True)
+    return Path(cfg.processed_dir) / f"climatology_{hashlib.md5(key.encode()).hexdigest()[:10]}.npz"
+
+
+def load_or_compute_climatology(cfg: Config, grid: dict, years: Sequence[int]) -> Dict[str, np.ndarray]:
+    """Mean profile of every feature at every grid point and calendar month over `years` (physical units), cached:
+    mean (12, cells, Z, F) with NaN where no profile reaches a level, count (12, cells, Z), cell_of (ny, nx) = index of
+    a grid point in `cells` (-1: no profile there)."""
+    path = _climatology_path(cfg, grid, years)
+    if path.exists():
+        with np.load(path) as f:
+            return {k: f[k] for k in f.files}
+    log.info("Computing the climatology of every grid point and calendar month (cached in %s)", path.name)
+    lat_ax, lon_ax = np.asarray(grid["lat"], dtype=np.float64), np.asarray(grid["lon"], dtype=np.float64)
+    nz, nf, nx = len(grid["depth"]), len(grid["features"]), len(lon_ax)
+    dirs = [Path(cfg.processed_dir) / f"year_{int(y)}" for y in years]
+
+    def flat_cells(d):
+        meta = np.load(d / "meta.npz")
+        return nearest_index(lat_ax, meta["lat"].astype(np.float64)) * nx + nearest_index(lon_ax, meta["lon"].astype(np.float64))
+
+    used = np.unique(np.concatenate([np.unique(flat_cells(d)) for d in dirs]))
+    cell_of = np.full(len(lat_ax) * nx, -1, dtype=np.int32)
+    cell_of[used] = np.arange(len(used), dtype=np.int32)
+    total, count = np.zeros((12 * len(used), nz, nf)), np.zeros((12 * len(used), nz))
+    lev = np.arange(nz)
+    for d in dirs:
+        prof = np.load(d / "profiles.npy", mmap_mode="r")
+        vlen = np.load(d / "valid_len.npy").astype(np.int64)
+        key = (profile_months(d) % 12) * len(used) + cell_of[flat_cells(d)]
+        for a in range(0, len(vlen), 50_000):
+            k = key[a:a + 50_000]
+            order = np.argsort(k, kind="stable")
+            uniq, start = np.unique(k[order], return_index=True)
+            total[uniq] += np.add.reduceat(np.asarray(prof[a:a + 50_000], dtype=np.float64)[order], start, axis=0)
+            count[uniq] += np.add.reduceat((lev[None, :] < vlen[a:a + 50_000, None])[order].astype(np.float64), start, axis=0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mean = np.where(count[..., None] > 0, total / count[..., None], np.nan).astype(np.float32)
+    out = {"mean": mean.reshape(12, len(used), nz, nf), "count": count.reshape(12, len(used), nz).astype(np.float32),
+           "cell_of": cell_of.reshape(len(lat_ax), nx)}
+    tmp = path.with_suffix(f".{os.getpid()}.tmp.npz")
+    np.savez(tmp, **out)
+    os.replace(tmp, path)
+    return out
+
+
+def climatology_of(cfg: Config) -> Dict[str, np.ndarray]:
+    """The climatology of the training years of cfg (computed once, then read from processed_dir)."""
+    grid = load_grid(cfg)
+    return load_or_compute_climatology(cfg, grid, resolve_splits(cfg, grid["years"])["train"])
+
+
 # --------------------------------------------------------------------------------------- statistics
 def _stats_path(cfg: Config, grid: dict, train_years: Sequence[int]) -> Path:
     key = json.dumps({"years": sorted(map(int, train_years)), "features": grid["features"],
@@ -179,7 +234,8 @@ def load_or_compute_stats(cfg: Config, grid: dict, train_years: Sequence[int]) -
 # --------------------------------------------------------------------------------------- dataset
 class ProfileDataset(Dataset):
     """Standardised profiles: x (Z, F) zero below valid_len, valid_len, ctx (C,); "lagged" drift removal applied.
-    extras=True (evaluation) adds x_raw (x without drift removal), lat, lon and month (months since 1970)."""
+    extras=True (evaluation) adds x_raw (x without drift removal), lat, lon, month (months since 1970) and time (the
+    time stamp of meta.npz: days since 1970 for daily data, months for monthly data; unit in self.time_unit)."""
 
     def __init__(self, cfg: Config, grid: dict, stats: Dict[str, np.ndarray], years: Sequence[int],
                  max_profiles: Optional[int] = None, seed: int = 0, in_memory: bool = True, extras: bool = False):
@@ -203,6 +259,8 @@ class ProfileDataset(Dataset):
             metas = [np.load(d / "meta.npz") for d in self.dirs]
             self._latlon = [(m["lat"].astype(np.float32), m["lon"].astype(np.float32)) for m in metas]
             self._months = [profile_months(d).astype(np.int32) for d in self.dirs]
+            self._times = [m["time"].astype(np.int64) for m in metas]
+            self.time_unit = str(metas[0]["time_unit"]) if "time_unit" in metas[0].files else "M"
         if self.lagged:  # per folder: reference of every calendar month (standardised) and each profile's month
             bm = load_or_compute_basin_monthly(cfg, grid)
             di = self.drift_idx
@@ -259,7 +317,8 @@ class ProfileDataset(Dataset):
         if self.extras:
             lat, lon = self._latlon[f]
             out.update(x_raw=torch.from_numpy(x_raw), lat=torch.tensor(float(lat[j])), lon=torch.tensor(float(lon[j])),
-                       month=torch.tensor(int(self._months[f][j]), dtype=torch.long))
+                       month=torch.tensor(int(self._months[f][j]), dtype=torch.long),
+                       time=torch.tensor(int(self._times[f][j]), dtype=torch.long))
         return out
 
 

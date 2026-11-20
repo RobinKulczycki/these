@@ -1,10 +1,12 @@
 """
-Scores of the FGN ensemble, the same for every predicted variable: fair CRPS, error of the member median (MAE, RMSE,
-bias = median - truth), coverage of the member range, spread-skill. Accumulated per row (D_input, spacing or distance
-to the nearest cast) and model level, per bin of the TRUE sigma0 of the predicted point, per lat/lon cell and density
-layer, per month of the record, per calendar month and level, and per season and lat/lon cell. Plus the rank
-histogram (calibration), the coherence of the members (between levels and between variables) and the oxycline
-(O2 < threshold) as a depth and as a density, from whole member profiles.
+Scores of the FGN ensemble, the same for every predicted variable: fair CRPS and its two terms (accuracy = mean
+distance of the members to the truth, minus spread = half the mean distance between two members), error of the member
+median (MAE, RMSE, bias = median - truth), coverage of the member range, spread-skill, and the variability of the
+truth itself. Accumulated per row (D_input, spacing or distance to the nearest cast) and model level, per region
+(deep sea / shelf) and level, per bin of the TRUE sigma0 of the predicted point, per lat/lon cell and density layer,
+per month of the record, per calendar month and level, and per season and lat/lon cell. Plus the rank histogram
+(calibration), the coherence of the members (between levels and between variables), the variogram score (vertical
+coherence) and the oxycline (O2 < threshold) as a depth and as a density, from whole member profiles.
 Evaluator.finish() returns everything as one dict of numpy arrays (saved as one .npz file, read by figures.py).
 """
 from __future__ import annotations
@@ -24,8 +26,10 @@ LONG_NAMES = {"o2": "O$_2$", "thetao": "temperature", "so": "salinity", "sigma0"
               "talk": "alkalinity", "ph": "pH"}
 SHORT_NAMES = {"o2": "O$_2$", "thetao": "T", "so": "S", "sigma0": "$\\sigma_0$", "chl": "chl", "no3": "NO$_3$",
                "po4": "PO$_4$", "dissic": "DIC", "talk": "TA", "ph": "pH"}
-POINT_KEYS = ("pinball", "abs_err", "sq_err", "bias", "covered", "ens_var", "sq_err_mean")
-MAP_KEYS = ("pinball", "bias", "abs_err", "covered", "ens_var", "sq_err_mean")
+POINT_KEYS = ("pinball", "accuracy", "spread_term", "abs_err", "sq_err", "bias", "covered", "ens_var", "sq_err_mean")
+TRUTH_KEYS = ("y", "y2")  # sums of the truth (standardised, no drift removal) and of its square: its variability
+MAP_KEYS = ("pinball", "bias", "abs_err", "covered", "ens_var", "sq_err_mean") + TRUTH_KEYS
+SHELF_M = 200.0  # region of a profile: shelf if its bottom is shallower
 TIME_KEYS = ("pinball", "bias", "abs_err")
 SEASON_KEYS = ("pinball", "bias")
 
@@ -75,7 +79,9 @@ def point_metrics(samples: torch.Tensor, y: torch.Tensor, tol: float) -> Dict[st
     srt = samples.sort(dim=1).values
     median = srt[:, m // 2] if m % 2 else 0.5 * (srt[:, m // 2 - 1] + srt[:, m // 2])
     mean = samples.mean(dim=1)
-    return {"pinball": 0.5 * crps_ensemble(samples, y), "abs_err": (y - median).abs(),
+    crps = crps_ensemble(samples, y)
+    accuracy = (samples - y.unsqueeze(1)).abs().mean(dim=1)
+    return {"pinball": 0.5 * crps, "accuracy": accuracy, "spread_term": accuracy - crps, "abs_err": (y - median).abs(),
             "sq_err": (y - median) ** 2, "bias": median - y,
             "covered": (y >= srt[:, 0] - tol) & (y <= srt[:, -1] + tol),
             "ens_var": ((samples - mean.unsqueeze(1)) ** 2).sum(dim=1) / max(m - 1, 1), "sq_err_mean": (y - mean) ** 2}
@@ -103,6 +109,26 @@ def coherence_sums(members: torch.Tensor, truth: torch.Tensor, idx: torch.Tensor
         levels.append((crps_ensemble(e[:, :, 1:] - e[:, :, :-1], truth[:, 1:] - truth[:, :-1]) * step).sum(dim=(0, 1)))
         pairs.append((crps_ensemble(e[..., a] - e[..., b], truth[..., a] - truth[..., b]) * mask[..., None]).sum(dim=(0, 1)))
     return torch.stack(levels).double(), torch.stack(pairs).double()
+
+
+def variogram_sums(members: torch.Tensor, truth: torch.Tensor, mask: torch.Tensor, generator, p: float = 0.5,
+                   lags: int = 5) -> torch.Tensor:
+    """Variogram score of order p (Scheuerer and Hamill 2015) of every variable, over the pairs of predicted levels
+    at most `lags` apart in the profile (weight 1 / distance in levels): sum of (|y_i - y_j|^p - mean over members of
+    |x_i - x_j|^p)^2. It only rewards members whose levels vary together as in the truth. The same for the members
+    shuffled independently at every level (same error bars, no vertical coherence).
+    members (B, M, T, V), truth (B, T, V) -> summed score [as predicted, shuffled] (2, V)."""
+    shuffled = members.gather(1, torch.rand(members.shape, generator=generator, device=members.device).argsort(dim=1))
+    out = []
+    for e in (members, shuffled):
+        total = torch.zeros(members.shape[-1], dtype=torch.float64, device=members.device)
+        for k in range(1, min(lags, truth.shape[1] - 1) + 1):
+            ok = (mask[:, k:] & mask[:, :-k]).unsqueeze(-1)
+            dy = (truth[:, k:] - truth[:, :-k]).abs() ** p
+            dx = ((e[:, :, k:] - e[:, :, :-k]).abs() ** p).mean(dim=1)
+            total += ((dy - dx) ** 2 * ok / k).sum(dim=(0, 1)).double()
+        out.append(total)
+    return torch.stack(out)
 
 
 def coherence(sums: np.ndarray) -> np.ndarray:
@@ -222,6 +248,7 @@ def scores(s: Dict[str, np.ndarray], n: np.ndarray, std: np.ndarray, n_members: 
     corr = (n_members + 1.0) / n_members
     with np.errstate(invalid="ignore", divide="ignore"):
         return {"count": np.broadcast_to(n, s["pinball"].shape).copy(), "crps": 2.0 * s["pinball"] / n * std,
+                "accuracy": s["accuracy"] / n * std, "spread_term": s["spread_term"] / n * std,
                 "mae": s["abs_err"] / n * std, "rmse": np.sqrt(s["sq_err"] / n) * std, "bias": s["bias"] / n * std,
                 "coverage": s["covered"] / n, "spread": np.sqrt(corr * s["ens_var"] / n) * std,
                 "rmse_ensmean": np.sqrt(s["sq_err_mean"] / n) * std,
@@ -234,9 +261,10 @@ class Evaluator:
     A score is a sum over the scored points (a level of a profile), kept in bins. The same points are binned in
     several ways, the "views" (prefix of the arrays in the metrics file):
       v   row x model level                        d   row x bin of the true sigma0
-      m   row x water-mass layer x map cell        t   row x water-mass layer x month of the record
+      z   region (deep sea, shelf) x model level   m   row x water-mass layer x map cell
+      t   row x water-mass layer x month of the record
       s   calendar month x model level             ms  season (DJF, MAM, JJA, SON) x map cell
-    plus the rank histogram, the coherence of the members and the oxycline."""
+    plus the rank histogram, the coherence of the members, the variogram score and the oxycline."""
 
     def __init__(self, cfg, grid: dict, stats, rows: Sequence[float], row_name: str, device):
         self.cfg, self.rows, self.row_name = cfg, list(rows), row_name
@@ -247,6 +275,7 @@ class Evaluator:
         aux_names, aux_feat = aux_feature_indices(cfg, grid)
         self.names, self.feat = [grid["target"]] + aux_names, [self.ti] + aux_feat
         self.std = np.array([float(stats["std"][f]) for f in self.feat])
+        self.mean = np.array([float(stats["mean"][f]) for f in self.feat])
         self.o2_mean, self.o2_std = float(stats["mean"][self.ti]), float(stats["std"][self.ti])
         self.tol = float(cfg.coverage_tol_mmol_m3) / self.o2_std  # standardised, the same for every variable
         self.n_members = int(cfg.fgn_eval_members)
@@ -272,9 +301,10 @@ class Evaluator:
         self.month0, self.n_t = (years[0] - 1970) * 12, (years[-1] - years[0] + 1) * 12
 
         nl, nc = len(self.layer_edges) + 1, self.ny * self.nx
-        self.shape = {"v": (n_rows, nz), "d": (n_rows, len(self.edges) - 1), "m": (n_rows, nl, nc),
+        self.shape = {"v": (n_rows, nz), "z": (2, nz), "d": (n_rows, len(self.edges) - 1), "m": (n_rows, nl, nc),
                       "t": (n_rows, nl, self.n_t), "s": (12, nz), "ms": (4, nc)}
-        self.keys = {"v": POINT_KEYS, "d": POINT_KEYS, "m": MAP_KEYS, "t": TIME_KEYS, "s": SEASON_KEYS, "ms": SEASON_KEYS}
+        self.keys = {"v": POINT_KEYS + TRUTH_KEYS, "z": POINT_KEYS + TRUTH_KEYS, "d": POINT_KEYS, "m": MAP_KEYS,
+                     "t": TIME_KEYS, "s": SEASON_KEYS, "ms": SEASON_KEYS}
         if self.si is None:
             del self.shape["d"]
 
@@ -285,10 +315,13 @@ class Evaluator:
         self.count = {view: zeros(int(np.prod(shape))) for view, shape in self.shape.items()}
         self.rank = zeros(nv, n_rows * (self.n_members + 1))  # rank of the truth among the members
         self.coh_levels, self.coh_pairs = zeros(n_rows, 2, nv), zeros(n_rows, 2, nv * (nv - 1) // 2)
+        self.vario, self.vario_n = zeros(n_rows, 2, nv), zeros(n_rows)
         self.oxy = OxyclineAccumulator(n_rows, device, cfg.oxycline_o2_threshold)
         self.map_oxy = {k: zeros(n_rows, nc) for k in ("crps", "abs_err", "covered", "count")}
         self.gen = torch.Generator(device=device)  # ties of the rank histogram, shuffling of the coherence score
         self.gen.manual_seed(int(cfg.seed))
+        self.gen_vario = torch.Generator(device=device)  # its own draws: the other scores stay as they were
+        self.gen_vario.manual_seed(int(cfg.seed) + 1)
 
     @torch.no_grad()
     def update(self, row, pred, aux, x, idx, mask, observed, valid_len, x_raw, lat, lon, month):
@@ -307,8 +340,9 @@ class Evaluator:
             sig_t = sig_prof.gather(1, idx)
             layer = torch.bucketize(sig_t, self._layers, right=True)
             bins["d"] = row * self.shape["d"][1] + torch.bucketize(sig_t, self._inner, right=True)
-        bins.update(v=row * nz + idx, m=(row * nl + layer) * nc + cell, t=(row * nl + layer) * self.n_t + t,
-                    s=cal * nz + idx, ms=((cal + 1) % 12 // 3) * nc + cell)
+        shelf = (self.depth[(valid_len - 1).clamp(min=0)] < SHELF_M).long()[:, None]
+        bins.update(v=row * nz + idx, z=shelf * nz + idx, m=(row * nl + layer) * nc + cell,
+                    t=(row * nl + layer) * self.n_t + t, s=cal * nz + idx, ms=((cal + 1) % 12 // 3) * nc + cell)
         scored = mask.reshape(-1)
         bins = {view: b.expand_as(idx).reshape(-1)[scored] for view, b in bins.items()}  # bin of every scored point
         for view, b in bins.items():
@@ -317,19 +351,25 @@ class Evaluator:
             y = torch.gather(x[..., f], 1, idx).float()
             members = (pred if v == 0 else aux[..., v - 1]).float()
             pm = {k: val.reshape(-1)[scored].double() for k, val in point_metrics(members, y, self.tol).items()}
+            y_raw = torch.gather(x_raw[..., f], 1, idx).float().reshape(-1)[scored].double()
+            pm.update(y=y_raw, y2=y_raw ** 2)
             for view, b in bins.items():
                 for k in self.keys[view]:
                     self.sums[view][k][v].index_add_(0, b, pm[k])
             if self.n_members > 1:
                 rank = truth_rank(members, y, self.tol, self.gen).reshape(-1)[scored]
                 self.rank[v].index_add_(0, row * (self.n_members + 1) + rank, torch.ones_like(rank, dtype=torch.float64))
+        every = pred.float().unsqueeze(-1) if aux is None else torch.cat([pred.float().unsqueeze(-1), aux.float()], dim=-1)
+        feat = torch.as_tensor(self.feat, device=idx.device)
+        at = idx[..., None].expand(-1, -1, len(self.feat))
+        truth_all = torch.gather(x.index_select(-1, feat), 1, at).float()
         if self.n_members > 1:
-            every = pred.float().unsqueeze(-1) if aux is None else torch.cat([pred.float().unsqueeze(-1), aux.float()], dim=-1)
-            feat = torch.as_tensor(self.feat, device=idx.device)
-            truth_all = torch.gather(x.index_select(-1, feat), 1, idx[..., None].expand(-1, -1, len(self.feat))).float()
             levels, pairs = coherence_sums(every, truth_all, idx, mask, self.gen)
             self.coh_levels[row] += levels
             self.coh_pairs[row] += pairs
+        shift = (torch.gather(x_raw.index_select(-1, feat), 1, at) - torch.gather(x.index_select(-1, feat), 1, at)).float()
+        self.vario[row] += variogram_sums(every + shift.unsqueeze(1), truth_all + shift, mask, self.gen_vario)
+        self.vario_n[row] += mask.any(dim=1).sum()
         truth = x[..., self.ti].float() * self.o2_std + self.o2_mean  # O2 is never drift-shifted
         members = pred.float() * self.o2_std + self.o2_mean
         sc = self.oxy.update(row, truth, members, idx, mask, observed, valid_len, self.depth, sig_prof)
@@ -341,7 +381,7 @@ class Evaluator:
 
     def finish(self) -> Dict[str, np.ndarray]:
         _all_reduce([t for group in self.sums.values() for t in group.values()] + list(self.count.values())
-                    + [self.rank, self.coh_levels, self.coh_pairs] + list(self.oxy.sums.values())
+                    + [self.rank, self.coh_levels, self.coh_pairs, self.vario, self.vario_n] + list(self.oxy.sums.values())
                     + list(self.map_oxy.values()))
         nv, n_rows, grid2d = len(self.names), len(self.rows), (self.ny, self.nx)
 
@@ -354,11 +394,14 @@ class Evaluator:
         out = {"rows": np.asarray(self.rows), "row_name": np.asarray(self.row_name),
                "experiment": np.asarray(self.cfg.experiment), "level_depths": self.depth.cpu().numpy().astype(np.float64),
                "variables": np.asarray(self.names), "units": np.asarray([UNITS.get(n, "") for n in self.names]),
-               "var_std": self.std, "n_members": np.asarray(self.n_members), "layer_edges": self.layer_edges,
+               "var_std": self.std, "var_mean": self.mean, "n_members": np.asarray(self.n_members),
+               "layer_edges": self.layer_edges,
                "v_loss": sums("v")["pinball"].sum(axis=(1, 2)) / max(count("v").sum(), 1.0)}
-        for view in ("v", "d"):  # scores per row and level / density bin
+        for view in ("v", "z", "d"):  # scores per row and level / region and level / density bin
             if view in self.shape:
                 out.update({f"{view}_{k}": val for k, val in scores(sums(view), count(view), self.std, self.n_members).items()})
+        for view in ("v", "z"):  # the truth itself: sums, so that figures.py can pool rows before taking the std
+            out.update({f"{view}_{k}": sums(view)[k] for k in TRUTH_KEYS})
         if "d" in self.shape:
             out["density_edges"] = self.edges
         o = {k: v.cpu().numpy() for k, v in self.oxy.sums.items()}
@@ -390,6 +433,7 @@ class Evaluator:
         a, b = np.triu_indices(nv, 1)
         pairs[..., a, b] = pairs[..., b, a] = self.coh_pairs.cpu().numpy()
         out["coh_variables"] = pairs
+        out["vario"], out["vario_n"] = self.vario.cpu().numpy(), self.vario_n.cpu().numpy()
         out["objective"] = np.asarray(objective(out))
         return out
 

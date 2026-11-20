@@ -59,11 +59,15 @@ drift_window_years + 1, Y - drift_lag_years]; the default of `cutoff` and `neigh
 | question | figures |
 |---|---|
 | How good, and where in the column? | `compare/`: `crps_`, `bias_`, `coverage_`, `spread_skill_` + `depth` / `density`; `heatmap_crps_*`, `relative_crps_*`, `summary.csv` |
+| Error against the variability at each depth? | `compare/crps_over_std_at_depth` (CRPS / std of the truth at that depth; levels where the truth barely varies left out), column `CRPS/std at its depth` of `summary.csv` |
+| Is a high CRPS a lack of accuracy or wrong confidence? | `compare/accuracy_spread_depth`: CRPS = accuracy (mean distance of the members to the truth) - spread term (half the mean distance between two members), deep sea and shelf (bottom < 200 m) apart |
+| Better than "the usual value there"? | every figure: `climatology` (mean of the training years at that grid point and level) and `climatology (same month)`, dashed, scored on the same points (`<metrics file>_clim.npz`, `_climmonth.npz`); `summary.csv`: skill = 1 - CRPS / CRPS of the climatology; `maps/maps_crps_vs_climatology` |
 | How does the error grow with the row (D_input, spacing, distance to the nearest given column)? | `compare/`: `crps_by_row`, `<variable>_per_row_*`, `heatmap_crps_*`, `oxycline_by_row` |
 | When? | `compare/`: `time_*` (every month of the evaluation years), `season_*` (calendar month; `_layers` = per water-mass layer), `season_depth_*` (calendar month x depth) |
-| Where in the sea? | `maps/`: `maps_*` (per variable, per water-mass layer, oxycline), `maps_<variable>_seasons` |
-| Are the error bars right? | `compare/`: `coverage_*`, `spread_skill_*`, `rank_histogram` (flat = calibrated, U = members too close together, dome = too far apart, slope = bias) |
-| Do the members hang together? | `compare/coherence`, `ensemble_all_variables` + `ensemble_coherence.csv`, `field_*` (`neighbours`) |
+| Where in the sea? | `maps/`: `maps_*` (per variable, per water-mass layer, oxycline), `maps_<variable>_seasons`; the error maps average every predicted level of a column and every evaluated day. `maps_<variable>_truth`: mean and std of the truth per layer (where the state changes) |
+| One day, at given depths? | `snapshot/` (cutoff, sparse): every column of one winter and one summer day at 30, 75, 150 m: truth, reconstruction, error, spread; `field_depths/` (neighbours) |
+| Are the error bars right? | `compare/`: `coverage_*`, `spread_skill_*`, `rank_histogram` (flat = calibrated, U = members too close together, dome = too far apart, slope = bias), `variability_and_coverage_depth` (how much each variable varies per depth, next to its coverage) |
+| Do the members hang together? | `compare/coherence`, `compare/variogram` (variogram score, vertical coherence), `ensemble_all_variables` (one column of the shelf, the deep sea west and east, with place and date) + `ensemble_coherence.csv`, `field_*` (`neighbours`) |
 | `neighbours`: 1, 2 or 4 given columns? | `casts/` |
 | `neighbours`: stations on a grid or placed like Argo floats, and how many? | `layouts/`: `layouts_error`, `layouts_map_1inN`, `layouts.csv` |
 | `neighbours`: how good is a map against the number of Argo-like floats? | `figures.py floats`: `floats_error`, `floats_variables`, `floats_maps`, `floats.csv` |
@@ -105,7 +109,8 @@ encoded with its offset (km east, km north); the target only gives its context (
 SSH). `neighbour_max_km` is how far
 the model may look: the scores are given per distance to the nearest given column (`neighbour_val_km`, bin upper
 edges, the last one >= `neighbour_max_km`). Each evaluation also scores a baseline, the inverse-distance-weighted
-mean of the same columns (`<metrics file>_idw.npz`), which `figures.py` adds to every figure.
+mean of the same columns (`<metrics file>_idw.npz`), which `figures.py` adds to every figure (with the climatologies,
+which `--eval-only` scores for every experiment).
 `neighbour_eval_casts=N` evaluates with exactly N given columns (`--tag` names the metrics file); training always
 draws 1..`neighbour_casts`. A sample has up to 5x the tokens of a cutoff one: lower `batch_size` if the GPU runs out
 of memory. Drift: `none` or `lagged`.

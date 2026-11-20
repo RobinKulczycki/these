@@ -33,7 +33,8 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 from config import FROZEN_ON_RESUME, Config, apply_overrides, config_from_checkpoint
 from dataset import (DRIFT_MODES, cutoff_levels, drift_indices, load_grid, load_or_compute_basin_monthly,
-                     load_or_compute_stats, make_dataset, max_input_levels, resolve_splits, subtract_shallowest)
+                     climatology_of, load_or_compute_stats, make_dataset, max_input_levels, nearest_index, resolve_splits,
+                     subtract_shallowest)
 from metrics import (Evaluator, combine_losses, crps_ensemble, ensemble_median, fill_columns,
                      mean_member_distance, scalars, summary_line)
 from model import aux_feature_indices, build_model, gather_levels, observation_mask
@@ -295,6 +296,38 @@ def idw_baseline(src_x, src_len, src_dxy, idx, feat):
     return est.gather(1, idx[..., None].expand(-1, -1, nv)).unsqueeze(1)
 
 
+class Climatology:
+    """Baselines that know only the place and the season: at the grid point of a profile, the mean of every level over
+    the training years, of every day ("clim") or of the days of the same calendar month ("climmonth")."""
+
+    KINDS = {"climmonth": "month", "clim": "annual"}
+
+    def __init__(self, clim: dict, grid: dict, stats, feat, device):
+        f = feat.cpu().numpy()
+        mean, count = clim["mean"][..., f].astype(np.float64), clim["count"].astype(np.float64)[..., None]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            annual = np.nansum(mean * count, axis=0) / count.sum(axis=0)
+        month = np.where(np.isfinite(mean), mean, annual[None])
+        mu, sd = np.asarray(stats["mean"])[f], np.asarray(stats["std"])[f]
+        both = np.concatenate([month, annual[None]]) - mu
+        self.table = torch.as_tensor(np.nan_to_num(both / sd, nan=0.0), dtype=torch.float32, device=device)  # (13, C, Z, V)
+        self.cell_of = torch.as_tensor(clim["cell_of"].reshape(-1), dtype=torch.long, device=device)
+        self.lat, self.lon = np.asarray(grid["lat"], dtype=np.float64), np.asarray(grid["lon"], dtype=np.float64)
+        self.feat = feat
+
+    def __call__(self, b: dict, x, idx, kind: str):
+        """Profiles of batch b -> the baseline at their predicted levels, in the model's (drift-shifted) standardised
+        space, as a one-member ensemble (B, 1, T, V)."""
+        iy = torch.as_tensor(nearest_index(self.lat, b["lat"].cpu().numpy().astype(np.float64)), device=x.device)
+        ix = torch.as_tensor(nearest_index(self.lon, b["lon"].cpu().numpy().astype(np.float64)), device=x.device)
+        cell = self.cell_of[iy * len(self.lon) + ix]
+        when = b["month"].long() % 12 if self.KINDS[kind] == "month" else torch.full_like(cell, 12)
+        vals = self.table[when, cell.clamp(min=0)] * (cell >= 0).float()[:, None, None]  # no climatology: training mean
+        at = idx[..., None].expand(-1, -1, self.feat.numel())
+        shift = torch.gather((b["x_raw"] - x).index_select(-1, self.feat), 1, at)
+        return (torch.gather(vals, 1, at) - shift).unsqueeze(1)
+
+
 # --------------------------------------------------------------------------------------- training / evaluation
 def train_one_epoch(model, loader, opt, sched, scaler, cfg: Config, task: Task, device, state, rank, ema=None):
     model.train()
@@ -344,16 +377,16 @@ def example_profiles(truth, members, idx, mask, obs, valid_len, n: int) -> dict:
 
 
 @torch.no_grad()
-def evaluate(model, loader, cfg: Config, grid: dict, stats, task: Task, device) -> tuple:
+def evaluate(model, loader, cfg: Config, grid: dict, stats, task: Task, device, clim: Optional[Climatology] = None) -> tuple:
     """Scores of every row (D_input, spacing or distance to the nearest cast) -> (metrics arrays, example profiles
-    for W&B, metrics arrays of the inverse-distance-weighted mean of the casts or None)."""
+    for W&B, {baseline name: its metrics arrays}). Baselines, scored on the same points like a one-member ensemble:
+    "idw" (neighbours: inverse-distance-weighted mean of the casts) and, with clim, "climmonth" and "clim"."""
     net = unwrap(model)
     net.eval()
     keys, rows, row_name = eval_rows(cfg, grid["depth"])
     ev = Evaluator(cfg, grid, stats, rows, row_name, device)
-    ev_idw = None
-    if cfg.experiment == "neighbours":  # the baseline is scored like a one-member ensemble
-        ev_idw = Evaluator(dataclasses.replace(cfg, fgn_eval_members=1), grid, stats, rows, row_name, device)
+    names = (["idw"] if cfg.experiment == "neighbours" else []) + (list(Climatology.KINDS) if clim is not None else [])
+    base_ev = {n: Evaluator(dataclasses.replace(cfg, fgn_eval_members=1), grid, stats, rows, row_name, device) for n in names}
     gen = torch.Generator(device=device)
     gen.manual_seed(int(cfg.seed) + 1000 * (dist.get_rank() if dist.is_available() and dist.is_initialized() else 0))
     example_row = len(keys) // 2 if cfg.experiment != "cutoff" else int(np.argmin([abs(r - 50.0) for r in rows]))
@@ -371,16 +404,17 @@ def evaluate(model, loader, cfg: Config, grid: dict, stats, task: Task, device) 
             mask = mask & given[:, None]
             where = (x, idx, mask, obs, sub["valid_len"], sub["x_raw"], sub["lat"], sub["lon"], sub["month"])
             truth, members = ev.update(i, pred.float(), None if aux is None else aux.float(), *where)
-            if ev_idw is not None:
-                base = idw_baseline(sub["src_x"], sub["src_len"], sub["src_dxy"], idx, task.feat)
-                ev_idw.update(i, base[..., 0], base[..., 1:] if aux is not None else None, *where)
+            for name, bev in base_ev.items():
+                base = (idw_baseline(sub["src_x"], sub["src_len"], sub["src_dxy"], idx, task.feat) if name == "idw"
+                        else clim(sub, x, idx, name))
+                bev.update(i, base[..., 0], base[..., 1:] if aux is not None else None, *where)
             if examples is None and i == example_row and cfg.example_profiles > 0 and bool(mask.any()):
                 examples = {**example_profiles(truth, members, idx, mask, obs, sub["valid_len"], cfg.example_profiles),
                             "row": rows[i], "rows": rows, "row_name": row_name, "depth": np.asarray(grid["depth"])}
     r = ev.finish()
     if cfg.experiment == "sparse":
         r["observed"] = nominal_observed(cfg, grid["depth"], rows)
-    return r, examples, (ev_idw.finish() if ev_idw is not None else None)
+    return r, examples, {name: bev.finish() for name, bev in base_ev.items()}
 
 
 # --------------------------------------------------------------------------------------- entry points
@@ -411,30 +445,38 @@ def load_run(path: Path, overrides, device):
     return cfg, grid, stats, model.to(device).eval()
 
 
-def save_metrics(path: Path, r: dict, r_idw: Optional[dict]) -> None:
-    """One file per evaluation; "neighbours" writes the scores of its baseline next to it (<name>_idw.npz)."""
+def save_metrics(path: Path, r: dict, baselines: dict) -> None:
+    """One file per evaluation, and the scores of every baseline next to it (<name>_idw.npz, _climmonth, _clim)."""
     np.savez_compressed(path, **r)
-    if r_idw is not None:
-        np.savez_compressed(path.with_name(path.stem + "_idw.npz"), **r_idw)
+    for name, rb in baselines.items():
+        np.savez_compressed(path.with_name(f"{path.stem}_{name}.npz"), **rb)
 
 
 def run_eval(args, ddp: bool, rank: int, device) -> None:
     path = Path(args.ckpt) if args.ckpt else Path(apply_overrides(Config(), args.set).ckpt_dir) / "best.pt"
     cfg, grid, stats, model = load_run(path, args.set, device)
     check_config(cfg, grid["depth"])
-    years = resolve_splits(cfg, load_grid(cfg)["years"])[args.split]
-    ds = make_dataset(cfg, grid, stats, years, False, max_profiles=args.max_profiles, seed=cfg.seed,
+    processed = load_grid(cfg)
+    splits = resolve_splits(cfg, processed["years"])
+    ds = make_dataset(cfg, grid, stats, splits[args.split], False, max_profiles=args.max_profiles, seed=cfg.seed,
                       in_memory=cfg.in_memory, extras=True)
-    r, examples, r_idw = evaluate(model, make_loader(ds, cfg, cfg.eval_batch_size, False, ddp), cfg, grid, stats,
-                                  Task(cfg, grid, stats, device), device)
+    if rank == 0:  # the climatology of the training years, computed once and cached in processed_dir
+        climatology_of(cfg)
+    if ddp:
+        dist.barrier()
+    task = Task(cfg, grid, stats, device)
+    clim = Climatology(climatology_of(cfg), processed, stats, task.feat, device)
+    r, examples, baselines = evaluate(model, make_loader(ds, cfg, cfg.eval_batch_size, False, ddp), cfg, grid, stats,
+                                      task, device, clim)
     if rank == 0:
         out = Path(cfg.ckpt_dir) / f"{args.split}_metrics{'_' + args.tag if args.tag else ''}.npz"
-        save_metrics(out, r, r_idw)
+        save_metrics(out, r, baselines)
         log.info("%s: %s -> %s", args.split, summary_line(r), out)
-        if r_idw is not None:
-            log.info("%s, inverse-distance-weighted casts: %s", args.split, summary_line(r_idw))
+        for name, rb in baselines.items():
+            log.info("%s, baseline %s: %s", args.split, name, summary_line(rb))
         run = init_wandb(cfg, None, f"eval-{args.split}", {"checkpoint": str(path), "tag": args.tag})
-        wandb_log(r, args.split, 0, True, examples, scalars(r_idw, f"{args.split}_idw") if r_idw is not None else {})
+        wandb_log(r, args.split, 0, True, examples,
+                  {k: v for name, rb in baselines.items() for k, v in scalars(rb, f"{args.split}_{name}").items()})
         run.finish()
 
 
@@ -529,14 +571,14 @@ def main() -> None:
             train_loader.sampler.set_epoch(epoch)
         train_one_epoch(model, train_loader, opt, sched, scaler, cfg, task, device, state, rank, ema)
         state["epoch"] = epoch + 1
-        r, examples, r_idw = evaluate(ema.model if ema is not None else model, val_loader, cfg, grid, stats, task, device)
+        r, examples, baselines = evaluate(ema.model if ema is not None else model, val_loader, cfg, grid, stats, task, device)
         is_best = float(r["objective"]) < state["best_val"]
         if is_best:
             state["best_val"] = float(r["objective"])
         if rank == 0:
             log.info("epoch %d | %s%s", epoch + 1, summary_line(r), "  *best*" if is_best else "")
             wandb_log(r, "val", state["step"], False, examples, {"val/best_loss": state["best_val"], "epoch": epoch + 1,
-                                                                  **(scalars(r_idw, "val_idw") if r_idw else {})})
+                                                                  **(scalars(baselines["idw"], "val_idw") if "idw" in baselines else {})})
             last = Path(cfg.ckpt_dir) / "last.pt"
             save_checkpoint(last, model=unwrap(model).state_dict(), ema=ema.model.state_dict() if ema else None,
                             optimizer=opt.state_dict(), scheduler=sched.state_dict(), scaler=scaler.state_dict(),
@@ -544,7 +586,7 @@ def main() -> None:
                             stats={k: np.asarray(v).tolist() for k, v in stats.items()})
             if is_best:
                 shutil.copyfile(last, Path(cfg.ckpt_dir) / "best.pt")
-                save_metrics(Path(cfg.ckpt_dir) / "val_metrics_best.npz", r, r_idw)
+                save_metrics(Path(cfg.ckpt_dir) / "val_metrics_best.npz", r, baselines)
         if ddp:
             dist.barrier()
     if rank == 0:
