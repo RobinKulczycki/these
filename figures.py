@@ -1142,7 +1142,7 @@ def cmd_ensemble(run: str, processed_dir: Optional[str], out: Path, row: Optiona
             pick.append(int(rng.choice(np.nonzero(ok)[0])))
             region_of.append(lab)
     sample_lat, sample_lon = lat_all, lon_all
-    b = {k: v[torch.as_tensor(pick, device=device)] for k, v in b.items()}
+    b = {k: v[torch.as_tensor(pick)].to(device) for k, v in b.items()}  # b is on the CPU
     var_names, truth, members, observed = predict(cfg, grid, stats, model, b, key, n_members)
     fig, axes = plt.subplots(len(pick), len(var_names) + 1, figsize=(2.3 * len(var_names) + 3.4, 2.9 * len(pick) + 1.2),
                              squeeze=False, gridspec_kw={"width_ratios": [1.5] + [1] * len(var_names)})
