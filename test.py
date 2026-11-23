@@ -231,7 +231,10 @@ def synthetic(tmp: Path) -> None:
     run("figures.py", "maps", f"100 km={runs / 'nb'}", f"70 km={runs / 'nb70'}", "--out", figs / "nb_ranges")
     out = run("figures.py", "field", runs / "nb", "--station-km", 90, "--out", figs / "nb_field")
     run("figures.py", "field", runs / "nb", "--station-km", 90, "--noise-km", 150, "--out", figs / "nb_field")
-    run("figures.py", "field", runs / "nb", "--station-km", 90, "--layout", "argo", "--out", figs / "nb_field")
+    run("figures.py", "field", runs / "nb", "--station-km", 90, "--layout", "argo", "--save", "--out", figs / "nb_field")
+    saved = metrics(next((figs / "nb_field").glob("field_all_*_argo.npz")))
+    check(saved["truth"].shape == saved["mean"].shape and saved["truth"].shape[2] == 9 and len(saved["stations_lat"]) > 0,
+          "field --save: every variable at every depth of the map, with the stations")
     line = next(x for x in out.splitlines() if "next to each other" in x)  # real error, members, noise per profile
     c = [float(x) for x in re.findall(r"-?\d+\.\d\d", line.split("):")[1])]
     check(c[1] > 0.5 > abs(c[2]), f"field: members sharing their noise are coherent between profiles ({c[1]:.2f}), "

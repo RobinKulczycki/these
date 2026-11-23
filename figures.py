@@ -1259,13 +1259,15 @@ def draw_field(ax, grid: dict, data: np.ndarray, cmap, norm, sea: np.ndarray, st
 
 def cmd_field(run: str, processed_dir: Optional[str], out: Path, split: str = "val", step: int = 0,
               station_km: float = 60.0, var: str = "o2", depth_m: float = 50.0, noise_km: Optional[float] = None,
-              layout: str = "grid", n_members: int = 19) -> None:
+              layout: str = "grid", n_members: int = 19, save_all: bool = False) -> None:
     """"neighbours": one time step mapped from stations about station_km apart (layout "argo": as many stations,
     placed like Argo floats: at random, a coastal column 20 times less likely). The columns are predicted
     together: a member gives close columns the same noise, which makes it a coherent map. Its noise varies smoothly
     over noise_km (default neighbour_max_km; 0 = one draw for the whole sea), so columns far apart get different
     draws. The last panel draws the noise per profile instead, as the scores do.
-    Also prints how alike two profiles are in the members and in the real error (their correlation over the map)."""
+    Also prints how alike two profiles are in the members and in the real error (their correlation over the map).
+    save_all: also writes field_all_<date>_stations<km>km[_argo].npz: every variable at every level of every predicted
+    column (truth, mean, std and two of the members, physical units), the stations, the date."""
     import torch
 
     from dataset import NeighbourDataset, load_grid, nearest_index, resolve_splits
@@ -1290,6 +1292,18 @@ def cmd_field(run: str, processed_dir: Optional[str], out: Path, split: str = "v
     else:  # (M, noise_dim): one draw per member
         noise = torch.randn(n_members, model.noise_dim, generator=torch.Generator().manual_seed(cfg.seed)).to(device)
     var_names, truth, coherent, _ = predict(cfg, grid, stats, model, b, None, n_members, noise)
+    if save_all:  # everything of this day, to draw any variable at any depth without the model
+        when = str(np.datetime64(int(ds._times[0][stations[0]]), ds.time_unit))
+        st_lat, st_lon = ds.position(0, stations)
+        out.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(out / f"field_all_{when}_stations{station_km:g}km{'_argo' if layout == 'argo' else ''}.npz",
+                            variables=np.asarray(var_names), units=np.asarray([UNITS.get(n, "") for n in var_names]),
+                            depth=np.asarray(grid["depth"]), grid_lat=np.asarray(grid["lat"]), grid_lon=np.asarray(grid["lon"]),
+                            lat=b["lat"].cpu().numpy(), lon=b["lon"].cpu().numpy(), valid_len=b["valid_len"].cpu().numpy(),
+                            truth=truth.astype(np.float32), mean=coherent.mean(axis=1).astype(np.float32),
+                            spread=coherent.std(axis=1).astype(np.float32), member1=coherent[:, 0].astype(np.float32),
+                            member2=coherent[:, 1].astype(np.float32), stations_lat=st_lat, stations_lon=st_lon,
+                            date=np.asarray(when), noise_km=np.asarray(noise_km), layout=np.asarray(layout))
     own = predict(cfg, grid, stats, model, b, None, n_members)[2]  # every profile draws its own noise
 
     v, k = var_names.index(var), int(np.argmin(np.abs(np.asarray(grid["depth"]) - depth_m)))
@@ -1705,6 +1719,7 @@ def main() -> None:
         s.add_argument("--step", type=int, default=0,
                        help="field: index of the time step (day or month) in the first year of the split")
         s.add_argument("--station-km", type=float, default=60.0, help="field: distance between the stations")
+        s.add_argument("--save", action="store_true", help="field: also save every variable at every depth (.npz)")
         s.add_argument("--layout", default="grid", choices=("grid", "argo"),
                        help="field: stations on a regular grid, or as many placed like Argo floats")
         s.add_argument("--var", default="o2", help="field: variable shown")
@@ -1743,7 +1758,7 @@ def main() -> None:
         return cmd_ensemble(str(run_dirs[0]), a.processed_dir, out, a.row, split=a.split)
     if a.cmd == "field":
         return cmd_field(str(run_dirs[0]), a.processed_dir, out, a.split, a.step, a.station_km, a.var, a.depth, a.noise_km,
-                         a.layout)
+                         a.layout, save_all=a.save)
     if a.cmd == "snapshot":
         return cmd_snapshot(str(run_dirs[0]), a.processed_dir, out, a.split, a.step, a.row, a.depths)
     if a.cmd == "floats":
